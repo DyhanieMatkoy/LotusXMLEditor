@@ -170,10 +170,10 @@ def _compute_cache_file_path() -> str:
     except Exception:
         pass
     try:
-        # Fallback to %APPDATA%\VisualXmlEditor
+        # Fallback to %APPDATA%\LotusXmlEditor
         appdata = os.environ.get('APPDATA')
         if appdata:
-            base = os.path.join(appdata, 'VisualXmlEditor')
+            base = os.path.join(appdata, 'LotusXmlEditor')
             os.makedirs(base, exist_ok=True)
             return os.path.join(base, 'language_cache.json')
     except Exception:

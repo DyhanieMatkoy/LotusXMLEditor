@@ -20,7 +20,7 @@ Date: 2025-10-03
 - Tree view collapse/expand actions synchronize with editor folding.
 
 ### Notes
-- UDL cache file location (Windows): `%APPDATA%\VisualXmlEditor\language_cache.json` or Qt `AppDataLocation` if available.
+- UDL cache file location (Windows): `%APPDATA%\LotusXmlEditor\language_cache.json` or Qt `AppDataLocation` if available.
 - If UDL definitions change, you can delete the cache file; it will be regenerated automatically.
 
 ### Bug Fixes

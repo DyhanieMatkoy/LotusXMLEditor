@@ -20,7 +20,7 @@
 - Built-in XML/JSON/HTML highlighters.
 - User-defined languages (UDL) loaded from XML profiles.
 - Compiled UDL regex cache (memory + disk) for fast language switching.
-  - Cache location (Windows): `%APPDATA%\VisualXmlEditor\language_cache.json` or Qt `AppDataLocation`.
+  - Cache location (Windows): `%APPDATA%\LotusXmlEditor\language_cache.json` or Qt `AppDataLocation`.
 
 ## Validation & Output
 - Real-time validation panel with line/column errors.

@@ -13,10 +13,10 @@ def build_executable():
     # PyInstaller arguments
     args = [
         'main.py',  # Main script
-        '--name=VisualXmlEditor',  # Name of the executable
+        '--name=LotusXmlEditor',  # Name of the executable
         '--onefile',  # Bundle everything into a single executable
         '--windowed',  # Windows subsystem (no console window)
-        '--icon=NONE',  # No icon specified - can be added later
+        '--icon=blotus.ico',  # Application icon
         '--hidden-import=PyQt6.QtCore',
         '--hidden-import=PyQt6.QtGui', 
         '--hidden-import=PyQt6.QtWidgets',
@@ -38,9 +38,9 @@ def build_executable():
         
         # Get the output directory
         if sys.platform == 'win32':
-            dist_path = os.path.join('dist', 'VisualXmlEditor.exe')
+            dist_path = os.path.join('dist', 'LotusXmlEditor.exe')
         else:
-            dist_path = os.path.join('dist', 'VisualXmlEditor')
+            dist_path = os.path.join('dist', 'LotusXmlEditor')
             
         print(f"\n✅ Build completed successfully!")
         print(f"Executable created at: {dist_path}")

@@ -40,7 +40,7 @@ python build_exe.py
 ### Build Output
 
 The executable will be created in the `dist` folder:
-- `dist/VisualXmlEditor.exe` - Standalone executable (~59MB)
+- `dist/LotusXmlEditor.exe` - Standalone executable (~59MB)
 
 ## Running the Application
 
@@ -52,7 +52,7 @@ python main.py
 ### Production Mode
 Run the executable directly:
 ```bash
-dist\VisualXmlEditor.exe
+dist\LotusXmlEditor.exe
 ```
 
 ## Keyboard Shortcuts

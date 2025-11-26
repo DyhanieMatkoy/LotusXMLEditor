@@ -25,6 +25,7 @@ from syntax import LanguageDefinition, LanguageRegistry, LanguageProfileCompiler
 from split_dialog import XmlSplitConfigDialog
 from file_navigator import FileNavigatorWidget
 from combine_dialog import CombineDialog
+from settings_dialog import SettingsDialog
 from multicolumn_tree import MultiColumnTreeWindow
 from structure_diagram import StructureDiagramWindow
 from auto_hide_manager import AutoHideManager
@@ -37,6 +38,7 @@ from exchange_manager import (
     package_zip,
     compute_exchange_dir,
 )
+from splash_screen import LoadingSplashScreen
 
 
 class XmlTreeWidget(QTreeWidget):
@@ -1549,6 +1551,16 @@ class MainWindow(QMainWindow):
         self.auto_save_timer.timeout.connect(self._auto_save)
         self.auto_save_timer.start(300000)  # 5 minutes
         
+        # Set up debounce timer for tree updates
+        self.tree_update_debounce_interval = 5000  # Default 5 seconds, configurable in settings
+        self.tree_update_timer = QTimer()
+        self.tree_update_timer.setSingleShot(True)
+        self.tree_update_timer.timeout.connect(self._debounced_tree_update)
+        self._pending_tree_content = None
+        
+        # Debug mode flag
+        self.debug_mode = False
+        
         # Theme is applied via persisted settings in _load_persisted_flags
         
         # Load recent files and open file if provided, otherwise open most recent
@@ -1770,6 +1782,7 @@ class MainWindow(QMainWindow):
         reconstruct_xml_action = QAction("Reconstruct from Parts...", self)
         reconstruct_xml_action.triggered.connect(self.reconstruct_from_parts)
         xml_menu.addAction(reconstruct_xml_action)
+
         
         # Quick Split and Structure Diagram
         xml_menu.addSeparator()
@@ -1778,10 +1791,14 @@ class MainWindow(QMainWindow):
         quick_split_action.triggered.connect(self.quick_split_three_parts)
         xml_menu.addAction(quick_split_action)
 
+
+        #  Structure Diagram
+        xml_menu.addSeparator()
         structure_diagram_action = QAction("Structure Diagram", self)
         structure_diagram_action.setToolTip("Open a layered diagram view of the XML structure")
         structure_diagram_action.triggered.connect(self.open_structure_diagram)
         xml_menu.addAction(structure_diagram_action)
+
         
         # 1C Exchange menu (Обмен с 1С)
         exchange_menu = menubar.addMenu("Обмен с 1С")
@@ -1879,11 +1896,25 @@ class MainWindow(QMainWindow):
         # Update Tree on Tab Switch toggle in View menu (mirrors toolbar toggle)
         self.toggle_update_tree_view_action = QAction("Update Tree on Tab Switch", self)
         self.toggle_update_tree_view_action.setCheckable(True)
-        self.toggle_update_tree_view_action.setChecked(True)
+        self.toggle_update_tree_view_action.setChecked(False)  # Default: off
+        #self.toggle_update_tree_view_action.setShortcut("F11")  # Hotkey: F9
 
         def _on_update_tree_view_toggled(checked: bool):
             # Set the underlying flag
             self.update_tree_on_tab_switch = checked
+            
+            # Disconnect or reconnect content_changed signal based on toggle state
+            try:
+                if checked:
+                    # Reconnect signal to enable live tree updates
+                    self.xml_editor.content_changed.connect(self.on_content_changed)
+                else:
+                    # Disconnect signal to prevent tree updates on every keystroke
+                    self.xml_editor.content_changed.disconnect(self.on_content_changed)
+            except Exception as e:
+                # Signal might already be connected/disconnected, ignore
+                pass
+            
             # Sync toolbar toggle if present
             if hasattr(self, 'update_tree_toggle'):
                 try:
@@ -1894,7 +1925,7 @@ class MainWindow(QMainWindow):
                     pass
             # Status and flags indicator
             if hasattr(self, 'status_label') and self.status_label:
-                self.status_label.setText(f"Tree update on tab switch {'enabled' if checked else 'disabled'}")
+                self.status_label.setText(f"Tree update {'enabled' if checked else 'disabled'}")
             try:
                 self._update_flags_indicator()
             except Exception:
@@ -2003,6 +2034,13 @@ class MainWindow(QMainWindow):
         multicolumn_tree_action.triggered.connect(self.open_multicolumn_tree)
         view_menu.addAction(multicolumn_tree_action)
 
+        # Settings menu
+        settings_menu = menubar.addMenu("Settings")
+        settings_action = QAction("Preferences...", self)
+        settings_action.setShortcut("Ctrl+,")
+        settings_action.triggered.connect(self.show_settings_dialog)
+        settings_menu.addAction(settings_action)
+
         # Help menu
         help_menu = menubar.addMenu("Help")
         hotkeys_action = QAction("Keyboard Shortcuts...", self)
@@ -2061,24 +2099,13 @@ class MainWindow(QMainWindow):
         # Language selector (XML by default + loaded UDL profiles)
         # Language selector moved to status bar
         
-        split_btn = QAction("Split XML", self)
-        split_btn.triggered.connect(self.show_split_dialog)
-        toolbar.addAction(split_btn)
-        
-        # One-button quick split into 3 parts for later root-merge combine
-        quick_split_btn = QAction("Quick Split (3 parts)", self)
-        quick_split_btn.setToolTip("Split current XML into three files by distributing top-level elements")
-        quick_split_btn.triggered.connect(self.quick_split_three_parts)
-        toolbar.addAction(quick_split_btn)
-        
-        # Structure Diagram view (levels left-to-right)
-        diagram_btn = QAction("Structure Diagram", self)
-        diagram_btn.setToolTip("Open a layered diagram view of the XML structure")
-        diagram_btn.triggered.connect(self.open_structure_diagram)
-        toolbar.addAction(diagram_btn)
+        #split_btn = QAction("Split XML", self)
+        #split_btn.triggered.connect(self.show_split_dialog)
+        #toolbar.addAction(split_btn)
         
         # Rebuild Tree button with auto-close tags
         rebuild_tree_btn = QAction("Rebuild Tree", self)
+        rebuild_tree_btn.setShortcut("F11")
         rebuild_tree_btn.setToolTip("Rebuild tree from editor content with auto-close unclosed tags")
         rebuild_tree_btn.triggered.connect(self.rebuild_tree_with_autoclose)
         toolbar.addAction(rebuild_tree_btn)
@@ -2258,15 +2285,29 @@ class MainWindow(QMainWindow):
         # Tree update on tab switch toggle (moved to status bar)
         self.update_tree_toggle = QAction("Update Tree on Tab Switch", self)
         self.update_tree_toggle.setCheckable(True)
-        self.update_tree_toggle.setChecked(True)
+        self.update_tree_toggle.setChecked(False)  # Default: off
+        self.update_tree_toggle.setShortcut("Shift+F11")  # Hotkey: Shift+F11
 
         def _on_update_tree_toggled(checked: bool):
             # Update button state
             self._update_button_state('updtree', checked)
             
             self.update_tree_on_tab_switch = checked
+            
+            # Disconnect or reconnect content_changed signal based on toggle state
+            try:
+                if checked:
+                    # Reconnect signal to enable live tree updates
+                    self.xml_editor.content_changed.connect(self.on_content_changed)
+                else:
+                    # Disconnect signal to prevent tree updates on every keystroke
+                    self.xml_editor.content_changed.disconnect(self.on_content_changed)
+            except Exception as e:
+                # Signal might already be connected/disconnected, ignore
+                pass
+            
             if hasattr(self, 'status_label') and self.status_label:
-                self.status_label.setText(f"Tree update on tab switch {'enabled' if checked else 'disabled'}")
+                self.status_label.setText(f"Tree update {'enabled' if checked else 'disabled'}")
             # Keep View menu toggle in sync
             if hasattr(self, 'toggle_update_tree_view_action'):
                 try:
@@ -2506,7 +2547,7 @@ class MainWindow(QMainWindow):
         self.tab_widget.setTabsClosable(True)
         self.tab_widget.tabCloseRequested.connect(self._close_tab)
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
-        self.update_tree_on_tab_switch = True
+        self.update_tree_on_tab_switch = False  # Default: off to avoid tree updates on every keystroke
         # Reduce tab bar height
         self.tab_widget.setStyleSheet("""
             QTabWidget::pane { border: 1px solid #ccc; }
@@ -2715,8 +2756,13 @@ class MainWindow(QMainWindow):
             btn.setStyleSheet("font-size: 9px; max-height: 22px; padding: 1px 3px; margin: 0px;")
 
     def _get_settings(self) -> QSettings:
-        return QSettings("visxml.net", "VisualXmlEditor")
+        return QSettings("visxml.net", "LotusXmlEditor")
 
+    def _debug_print(self, message: str):
+        """Print debug message if debug mode is enabled"""
+        if getattr(self, 'debug_mode', False):
+            print(message)
+    
     def _save_flag(self, key: str, value: bool):
         try:
             s = self._get_settings()
@@ -2807,7 +2853,7 @@ class MainWindow(QMainWindow):
                 self.xml_tree.use_friendly_labels = val
                 self.xml_tree.refresh_labels()
         # Update tree on tab switch (both actions reflect)
-        val_upd = read_bool('update_tree_on_tab_switch', True)
+        val_upd = read_bool('update_tree_on_tab_switch', False)  # Default: off
         if hasattr(self, 'update_tree_toggle'):
             try:
                 self.update_tree_toggle.blockSignals(True)
@@ -2825,6 +2871,22 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self.update_tree_on_tab_switch = val_upd
+        # Apply the signal connection state based on loaded setting
+        try:
+            if val_upd:
+                # Ensure signal is connected
+                try:
+                    self.xml_editor.content_changed.connect(self.on_content_changed)
+                except Exception:
+                    pass  # Already connected
+            else:
+                # Ensure signal is disconnected
+                try:
+                    self.xml_editor.content_changed.disconnect(self.on_content_changed)
+                except Exception:
+                    pass  # Already disconnected
+        except Exception:
+            pass
         # Hide leaves
         if hasattr(self, 'toggle_hide_leaves_action'):
             val = read_bool('hide_leaves', True)
@@ -2895,6 +2957,17 @@ class MainWindow(QMainWindow):
                 pass
             self.exchange_mode = 'semi' if val else 'manual'
 
+        # Load debounce interval from settings
+        try:
+            debounce_val = s.value('tree_update_debounce', 5000, type=int)
+            self.tree_update_debounce_interval = debounce_val
+        except Exception:
+            self.tree_update_debounce_interval = 5000
+        
+        # Load debug mode from settings
+        debug_mode_val = read_bool('debug_mode', False)
+        self.debug_mode = debug_mode_val
+        
         # Auto-hide preferences
         toolbar_autohide_val = read_bool('toolbar_autohide', True)
         tree_header_autohide_val = read_bool('tree_header_autohide', True)
@@ -2936,21 +3009,21 @@ class MainWindow(QMainWindow):
         # Apply auto-hide after UI is fully rendered (use QTimer to delay)
         def apply_autohide():
             try:
-                print(f"DEBUG: Applying auto-hide - toolbar:{toolbar_autohide_val}, tree_header:{tree_header_autohide_val}, tree_column:{tree_column_header_autohide_val}, tab_bar:{tab_bar_autohide_val}")
+                self._debug_print(f"DEBUG: Applying auto-hide - toolbar:{toolbar_autohide_val}, tree_header:{tree_header_autohide_val}, tree_column:{tree_column_header_autohide_val}, tab_bar:{tab_bar_autohide_val}")
                 if hasattr(self, 'toolbar_auto_hide'):
                     self.toolbar_auto_hide.set_auto_hide_enabled(toolbar_autohide_val)
-                    print(f"DEBUG: Toolbar auto-hide applied, enabled={self.toolbar_auto_hide.auto_hide_enabled}")
+                    self._debug_print(f"DEBUG: Toolbar auto-hide applied, enabled={self.toolbar_auto_hide.auto_hide_enabled}")
                 if hasattr(self, 'tree_header_auto_hide'):
                     self.tree_header_auto_hide.set_auto_hide_enabled(tree_header_autohide_val)
-                    print(f"DEBUG: Tree header auto-hide applied, enabled={self.tree_header_auto_hide.auto_hide_enabled}")
+                    self._debug_print(f"DEBUG: Tree header auto-hide applied, enabled={self.tree_header_auto_hide.auto_hide_enabled}")
                 if hasattr(self, 'tree_column_header_auto_hide'):
                     self.tree_column_header_auto_hide.set_auto_hide_enabled(tree_column_header_autohide_val)
-                    print(f"DEBUG: Tree column header auto-hide applied, enabled={self.tree_column_header_auto_hide.auto_hide_enabled}")
+                    self._debug_print(f"DEBUG: Tree column header auto-hide applied, enabled={self.tree_column_header_auto_hide.auto_hide_enabled}")
                 if hasattr(self, 'tab_bar_auto_hide'):
                     self.tab_bar_auto_hide.set_auto_hide_enabled(tab_bar_autohide_val)
-                    print(f"DEBUG: Tab bar auto-hide applied, enabled={self.tab_bar_auto_hide.auto_hide_enabled}")
+                    self._debug_print(f"DEBUG: Tab bar auto-hide applied, enabled={self.tab_bar_auto_hide.auto_hide_enabled}")
             except Exception as e:
-                print(f"DEBUG: Error applying auto-hide: {e}")
+                self._debug_print(f"DEBUG: Error applying auto-hide: {e}")
                 import traceback
                 traceback.print_exc()
         
@@ -3171,7 +3244,9 @@ class MainWindow(QMainWindow):
     
     def _connect_signals(self):
         """Connect signals"""
-        self.xml_editor.content_changed.connect(self.on_content_changed)
+        # Only connect content_changed if update_tree_on_tab_switch is enabled
+        if getattr(self, 'update_tree_on_tab_switch', False):
+            self.xml_editor.content_changed.connect(self.on_content_changed)
         self.xml_editor.cursor_position_changed.connect(self.on_cursor_changed)
         self.xml_tree.node_selected.connect(self.on_tree_node_selected)
         # Find results double-click → navigate to match
@@ -3596,11 +3671,16 @@ class MainWindow(QMainWindow):
                 
                 # For large files (>1MB), show progress and use chunked reading
                 if file_size > 1024 * 1024:
-                    self.status_label.setText(f"Loading large file ({file_size / 1024 / 1024:.1f} MB)...")
+                    # Show splash screen for large files
+                    splash = LoadingSplashScreen()
+                    splash.show()
+                    splash.show_message(f"Loading large file ({file_size / 1024 / 1024:.1f} MB)...")
                     QApplication.processEvents()  # Update UI
                     
                     # Read large files in chunks to avoid memory issues
                     content = self._read_large_file(file_path)
+                    
+                    splash.close()
                 else:
                     # Read small files normally
                     with open(file_path, 'r', encoding='utf-8') as file:
@@ -3852,6 +3932,14 @@ class MainWindow(QMainWindow):
             line_number = dialog.get_line_number()
             self.goto_line(line_number)
 
+    def show_settings_dialog(self):
+        """Show settings dialog"""
+        try:
+            dialog = SettingsDialog(self)
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.warning(self, "Settings Error", f"Failed to open settings: {e}")
+    
     def show_hotkey_help(self):
         """Show a dialog with a complete hotkey reference."""
         try:
@@ -4364,11 +4452,24 @@ Total size: {stats.total_size} bytes"""
             QMessageBox.critical(self, "Ошибка", "Не удалось создать ZIP")
     
     def on_content_changed(self):
-        """Handle content change"""
+        """Handle content change with debounce"""
         # Suppress handling during programmatic file loads to avoid repeated rebuilds
         if getattr(self, '_loading_file', False):
             return
-        content = self.xml_editor.get_content()
+        
+        # Store content and restart debounce timer
+        self._pending_tree_content = self.xml_editor.get_content()
+        self.tree_update_timer.stop()
+        self.tree_update_timer.start(self.tree_update_debounce_interval)
+    
+    def _debounced_tree_update(self):
+        """Actually update the tree after debounce period"""
+        if self._pending_tree_content is None:
+            return
+        
+        content = self._pending_tree_content
+        self._pending_tree_content = None
+        
         self.xml_tree.populate_tree(content)
         # Reset caches and optionally rebuild index based on new content size
         try:
@@ -4379,11 +4480,11 @@ Total size: {stats.total_size} bytes"""
             self.path_line_index = {}
             if self.sync_index_enabled:
                 self._build_path_line_index(content)
-                print(f"DEBUG: Rebuilt index after content change, entries={len(self.path_line_index)}")
+                self._debug_print(f"DEBUG: Rebuilt index after content change, entries={len(self.path_line_index)}")
             else:
-                print("DEBUG: Index/cache disabled after content change (small file)")
+                self._debug_print("DEBUG: Index/cache disabled after content change (small file)")
         except Exception as e:
-            print(f"DEBUG: Error handling index/cache on content change: {e}")
+            self._debug_print(f"DEBUG: Error handling index/cache on content change: {e}")
         
         # Dump tree data to file for debugging (disabled by default)
         if self.tree_debug_enabled:

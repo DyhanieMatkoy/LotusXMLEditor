@@ -321,7 +321,7 @@ python_version/
 
 To speed up language switching and custom syntax profiles (UDL), the app caches compiled UDL regex metadata to disk. This avoids re-building large alternation expressions on every run and improves startup and language change performance.
 
-- Cache location (Windows): `%APPDATA%\\VisualXmlEditor\\language_cache.json`.
+- Cache location (Windows): `%APPDATA%\\LotusXmlEditor\\language_cache.json`.
 - If Qt `QStandardPaths` is available, the cache is stored under the app's `AppDataLocation`.
 - Fallback: a `language_cache.json` file next to the application if no AppData location is available.
 
