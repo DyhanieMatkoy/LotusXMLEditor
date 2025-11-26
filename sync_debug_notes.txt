@@ -1,0 +1,80 @@
+# XML Editor Sync Problems - Debug Notes
+
+## Issues Identified
+
+### 1. BOM Character Handling
+- **Problem**: UTF-8 BOM (Byte Order Mark) characters at the beginning of XML files were not being properly handled
+- **Impact**: Root element parsing was failing, causing sync to not work correctly
+- **Solution**: Added BOM character removal in `_get_element_path_at_line` method using `line.lstrip('\ufeff')`
+- **Files Modified**: `main.py` (lines ~1580-1630)
+
+### 2. XPath Generation Issues
+- **Problem**: The `_get_element_path_at_line` method was generating incorrect XPath-like paths
+- **Impact**: Tree selection couldn't find the correct XML element
+- **Solution**: Enhanced path generation logic to properly handle:
+  - Element nesting
+  - Self-closing tags
+  - Sibling element counting
+  - Comment and CDATA sections
+
+### 3. Tree-to-Text Synchronization Logic
+- **Problem**: Sync between tree selection and text editor cursor was unreliable
+- **Impact**: Users couldn't navigate XML by clicking in tree or moving cursor in editor
+- **Current Status**: Sync temporarily disabled for debugging
+
+## Debugging Tools Implemented
+
+### 1. Tree Debug Dumping
+- **File**: `treedebug.txt`
+- **Purpose**: Logs tree structure and sync attempts
+- **Content**: 
+  - XML content loading information
+  - Tree structure with node paths
+  - Sync attempt details
+  - Generated XPath information
+
+### 2. Console Logging
+- **Location**: `_sync_tree_to_cursor` method
+- **Purpose**: Real-time debugging information
+- **Content**:
+  - Sync attempt notifications
+  - Content length and cursor position
+  - Generated XPath paths
+  - Error messages
+
+### 3. Todo List Tracking
+- **File**: Managed via todo_write tool
+- **Purpose**: Track sync-related tasks and progress
+- **Current Tasks**:
+  - BOM character handling (✓ Complete)
+  - XPath generation fixes (✓ Complete)
+  - Tree data dumping (✓ Complete)
+  - Manual debugging tools
+  - Sync testing with Cyrillic XML
+
+## Next Steps
+
+1. **Test with Cyrillic XML Files**
+   - Use test file with BOM characters
+   - Verify path generation works correctly
+   - Test sync functionality
+
+2. **Re-enable Sync Carefully**
+   - Gradually restore sync functionality
+   - Add more error handling
+   - Test edge cases
+
+3. **Performance Optimization**
+   - Consider caching generated paths
+   - Optimize tree traversal
+   - Handle large files efficiently
+
+## Test File Information
+
+The test XML file contains:
+- UTF-8 BOM characters
+- Cyrillic element names (ПравилаОбмена, ПослеЗагрузкиДанных)
+- Nested structure
+- Multiple levels of elements
+
+This file is ideal for testing the sync fixes.

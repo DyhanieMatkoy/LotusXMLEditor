@@ -1,0 +1,41 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Packaging / build artifacts
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# Test and coverage
+.pytest_cache/
+.coverage*
+.nox/
+.tox/
+
+# Logs
+logs/
+*.log
+
+# IDE / Editor
+.vscode/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# PyInstaller (executables and installers)
+*.exe
+*.msi
+*.manifest
+
+# Project-specific generated data
+xml_split_output/parts/
+*.autosave
