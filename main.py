@@ -6,6 +6,8 @@ A modern XML editor with tree view, syntax highlighting, and validation
 
 import sys
 import os
+import random
+import subprocess
 from version import __version__, __build_date__, __app_name__
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QTreeWidget, 
                              QTreeWidgetItem, QTextEdit, QStatusBar, QMenuBar, 
@@ -13,10 +15,15 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QTreeWidget,
                              QTabWidget, QListWidget, QListWidgetItem, QPushButton, QLabel, 
                              QFileDialog, QMessageBox, QLineEdit, QCheckBox, QComboBox, QToolButton,
                              QDialog, QDialogButtonBox, QSpinBox, QFrame,
-                             QHeaderView, QTreeWidgetItemIterator, QMenu, QDockWidget, QProgressBar)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QDateTime, QSettings
-from PyQt6.QtGui import QAction, QIcon, QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QTextCursor, QPainter
+                             QHeaderView, QTreeWidgetItemIterator, QMenu, QDockWidget, QProgressBar, QInputDialog, QStyle)
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QDateTime, QSettings, QThread, QByteArray, QMimeData, QUrl
+from PyQt6.QtGui import QAction, QIcon, QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QTextCursor, QPainter, QShortcut, QKeySequence
 import re
+import zipfile
+import json
+import base64
+import tempfile
+import shutil
 
 from xml_service import XmlService
 from models import XmlFileModel, XmlTreeNode, XmlValidationResult
@@ -39,11 +46,17 @@ from exchange_manager import (
     compute_exchange_dir,
 )
 from splash_screen import LoadingSplashScreen
+from fragment_dialog import FragmentEditorDialog
+from line_number_widget import LineNumberWidget
+from metro_navigator import MetroNavigatorWindow
+from about_dialog import AboutDialog
 
 
 class XmlTreeWidget(QTreeWidget):
     """Custom tree widget for displaying XML structure"""
     node_selected = pyqtSignal(object)
+    delete_node_requested = pyqtSignal(object)
+    hide_node_requested = pyqtSignal(object)
     
     def __init__(self, status_label=None):
         super().__init__()
@@ -54,16 +67,26 @@ class XmlTreeWidget(QTreeWidget):
         self.setAlternatingRowColors(True)
         self.itemClicked.connect(self._on_item_clicked)
         
+        # Context menu
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+        
         # Quick Win #2: Enable uniform row heights for faster rendering (20-40% faster)
         self.setUniformRowHeights(True)
         
         # Level collapse buttons
         self.level_buttons = []
         self.max_depth = 0
+        self.max_load_depth = 2  # Default load depth
+        self.max_level_buttons = 5  # Default: show max 5 level buttons
 
         # Level header mount container reference (assigned by MainWindow)
         self.header_container = None
         self.current_header_widget = None
+        
+        # Search filter
+        self.search_filter_text = ""
+        self.search_matches = []  # Store matching items
         
         # Enable column stretching
         self.setRootIsDecorated(True)
@@ -71,39 +94,229 @@ class XmlTreeWidget(QTreeWidget):
         self.header().setStretchLastSection(False)
         self.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        
+        # Shortcuts
+        self.expand_2_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Right"), self)
+        self.expand_2_shortcut.activated.connect(self._expand_selected_2_levels)
+        
         # Default: hide value column when leaves are hidden
         try:
             self.setColumnHidden(1, self.hide_leaves_enabled)
             self._update_header_resize_modes()
         except Exception:
             pass
+            
+        # Connect expansion signal for lazy loading
+        try:
+            self.itemExpanded.connect(self._on_item_expanded)
+        except Exception:
+            pass
 
-    def compute_display_name(self, xml_node):
+    def _show_context_menu(self, position):
+        """Show context menu for tree items"""
+        item = self.itemAt(position)
+        if not item:
+            return
+            
+        menu = QMenu(self)
+        
+        # Expand actions
+        expand_action = QAction("Expand All Children", self)
+        expand_action.triggered.connect(lambda: self._expand_recursive(item))
+        menu.addAction(expand_action)
+        
+        expand_2_action = QAction("Expand Next 2 Levels", self)
+        expand_2_action.triggered.connect(lambda: self._expand_levels(item, 2))
+        menu.addAction(expand_2_action)
+        
+        collapse_action = QAction("Collapse All Children", self)
+        collapse_action.triggered.connect(lambda: self._collapse_recursive(item))
+        menu.addAction(collapse_action)
+        
+        menu.addSeparator()
+        
+        # Copy actions
+        copy_tag_action = QAction("Copy Tag Name", self)
+        copy_tag_action.triggered.connect(lambda: QApplication.clipboard().setText(item.text(0)))
+        menu.addAction(copy_tag_action)
+        
+        if item.text(1):
+            copy_val_action = QAction("Copy Value", self)
+            copy_val_action.triggered.connect(lambda: QApplication.clipboard().setText(item.text(1)))
+            menu.addAction(copy_val_action)
+        
+        menu.addSeparator()
+        
+        # Delete/Hide actions
+        delete_action = QAction("Delete XML Block", self)
+        delete_action.triggered.connect(lambda: self.delete_node_requested.emit(item.xml_node))
+        menu.addAction(delete_action)
+        
+        hide_action = QAction("Hide XML Block", self)
+        hide_action.triggered.connect(lambda: self.hide_node_requested.emit(item.xml_node))
+        menu.addAction(hide_action)
+            
+        menu.exec(self.mapToGlobal(position))
+        
+    def _expand_recursive(self, item):
+        """Recursively expand an item and all its children"""
+        self.expandItem(item)
+        for i in range(item.childCount()):
+            self._expand_recursive(item.child(i))
+            
+    def _expand_selected_2_levels(self):
+        """Expand selected items by 2 levels"""
+        for item in self.selectedItems():
+            self._expand_levels(item, 2)
+
+    def mouseDoubleClickEvent(self, event):
+        """Handle double click to force deep expansion if collapsed"""
+        item = self.itemAt(event.pos())
+        if item and not item.isExpanded():
+            # Custom expansion (2 levels)
+            self._expand_levels(item, 2)
+            # Prevent default behavior which might conflict or be redundant
+            return
+            
+        # Otherwise default behavior (e.g. collapse if expanded)
+        super().mouseDoubleClickEvent(event)
+
+    def _expand_levels(self, item, levels):
+        """Expand item to specific depth"""
+        if levels <= 0:
+            return
+        self.expandItem(item)
+        for i in range(item.childCount()):
+            self._expand_levels(item.child(i), levels - 1)
+            
+    def _collapse_recursive(self, item):
+        """Recursively collapse an item and all its children"""
+        for i in range(item.childCount()):
+            self._collapse_recursive(item.child(i))
+        self.collapseItem(item)
+
+    def _finish_lazy_load(self, root, xml_content, progress_dialog):
+        if root is None:
+            error_item = QTreeWidgetItem()
+            error_item.setText(0, "Tree building failed")
+            error_item.setText(1, "File content is available in the editor")
+            error_item.setForeground(0, QColor("red"))
+            self.addTopLevelItem(error_item)
+            if self.status_label:
+                self.status_label.setText("Tree building failed - content available in editor")
+            if progress_dialog:
+                main_window = self.window()
+                if hasattr(main_window, 'status_bar'):
+                    main_window.status_bar.removeWidget(progress_dialog)
+                progress_dialog.deleteLater()
+            self.setUpdatesEnabled(True)
+            return
+        lines = xml_content.split('\n')
+        line_index = None
+        self._xml_root = root
+        self._xml_lines = lines
+        self._xml_line_index = line_index
+        root_node = self._xml_service._element_to_shallow_node_with_lines(root, lines, "", 0, 1, line_index)
+        item = QTreeWidgetItem()
+        item.setText(0, self.compute_display_name(root_node, root))
+        item.setText(1, self._truncate_value(root_node.value) if root_node.value else "")
+        item.xml_node = root_node
+        item.xml_element = root
+        item.lazy_loaded = False
+        self.addTopLevelItem(item)
+        if len(root):
+            placeholder = QTreeWidgetItem()
+            placeholder.setText(0, "...")
+            placeholder.is_placeholder = True
+            item.addChild(placeholder)
+        
+        # Signal is already connected in __init__
+        # Expand to selected depth
+        self.expand_to_level(self.max_load_depth)
+                    
+        self.apply_hide_leaves_filter()
+        if self.status_label:
+            self.status_label.setText("Lazy tree ready")
+        if progress_dialog:
+            main_window = self.window()
+            if hasattr(main_window, 'status_bar'):
+                main_window.status_bar.removeWidget(progress_dialog)
+            progress_dialog.deleteLater()
+        self.setUpdatesEnabled(True)
+
+        self._xml_root = None
+        self._xml_lines = []
+        self._xml_line_index = None
+        try:
+            self._xml_service = XmlService()
+        except Exception:
+            self._xml_service = None
+
+    def compute_display_name(self, xml_node, xml_element=None):
         """Compute label for a node based on current mode."""
         if not xml_node:
             return ""
+            
+        # 1. Calculate attributes string (common)
+        attr = getattr(xml_node, 'attributes', {}) or {}
+        attr_string = " ".join([f'{k}="{v}"' for k, v in attr.items()])
+        
+        # 2. Extract friendly name
+        # Optimization: Skip extraction entirely if friendly labels are disabled
+        # This restores fast loading for large files when the setting is OFF
         if not self.use_friendly_labels:
-            attr = getattr(xml_node, 'attributes', {}) or {}
-            attr_string = " ".join([f'{k}="{v}"' for k, v in attr.items()])
-            return f"{xml_node.tag} [{attr_string}]" if attr_string else f"{xml_node.tag}"
-
-        display_name = xml_node.name
+             return f"{xml_node.tag} [{attr_string}]" if attr_string else f"{xml_node.tag}"
+        
         preferred_name = None
+        found = False
+        
+        # Try XmlTreeNode children first (populated nodes)
         try:
-            for child in getattr(xml_node, 'children', []) or []:
-                if getattr(child, 'tag', '') in ("Наименование", "Имя", "Name") and getattr(child, 'value', None):
-                    text = child.value.strip()
-                    if text:
-                        preferred_name = text
-                        break
+            children = getattr(xml_node, 'children', []) or []
+            if children:
+                # Limit scan to first 50 children to prevent freeze on massive nodes
+                for child in children[:50]:
+                    tag = getattr(child, 'tag', '')
+                    if tag and tag.lower() in ("наименование", "имя", "name") and getattr(child, 'value', None):
+                        text = child.value.strip()
+                        if text:
+                            preferred_name = text
+                            found = True
+                            break
         except Exception:
-            preferred_name = None
+            pass
 
+        # If not found and xml_element provided, try raw element children (shallow nodes)
+        if not found and xml_element is not None:
+            try:
+                # Limit iteration count for raw element children as well
+                count = 0
+                for child in xml_element:
+                    count += 1
+                    if count > 50: # Optimization: Stop after checking 50 children
+                        break
+                        
+                    tag = getattr(child, 'tag', '')
+                    # Handle namespaces if present in tag (e.g. {ns}tag)
+                    if isinstance(tag, str) and '}' in tag:
+                        tag = tag.split('}', 1)[1]
+                        
+                    if tag and tag.lower() in ("наименование", "имя", "name"):
+                        text = getattr(child, 'text', '')
+                        if text and text.strip():
+                            preferred_name = text.strip()
+                            found = True
+                            break
+            except Exception:
+                pass
+
+        # 3. Format based on mode
+        # Friendly mode: "Friendly (Tag [attrs])"
         if preferred_name:
-            attr = getattr(xml_node, 'attributes', {}) or {}
-            attr_string = " ".join([f'{k}="{v}"' for k, v in attr.items()])
-            display_name = f"{preferred_name} ({xml_node.tag} [{attr_string}])" if attr_string else f"{preferred_name} ({xml_node.tag})"
-        return display_name
+            return f"{preferred_name} ({xml_node.tag} [{attr_string}])" if attr_string else f"{preferred_name} ({xml_node.tag})"
+            
+        # Fallback for Friendly mode (no friendly name found)
+        return f"{xml_node.tag} [{attr_string}]" if attr_string else f"{xml_node.tag}"
 
     def refresh_labels(self):
         """Refresh all labels according to mode without rebuilding structure."""
@@ -112,7 +325,7 @@ class XmlTreeWidget(QTreeWidget):
             while iterator.value():
                 item = iterator.value()
                 if item and hasattr(item, 'xml_node') and item.xml_node:
-                    item.setText(0, self.compute_display_name(item.xml_node))
+                    item.setText(0, self.compute_display_name(item.xml_node, getattr(item, 'xml_element', None)))
                 iterator += 1
             self.viewport().update()
         except Exception as e:
@@ -236,15 +449,31 @@ class XmlTreeWidget(QTreeWidget):
         collapse_all_btn.setStyleSheet("font-size: 9px; padding: 1px;")
         header_layout.addWidget(collapse_all_btn)
         
-        # Add level buttons
+        # Add Load Depth SpinBox
+        depth_label = QLabel("Depth:")
+        depth_label.setStyleSheet("font-size: 9px;")
+        header_layout.addWidget(depth_label)
+        
+        depth_spin = QSpinBox()
+        depth_spin.setRange(1, 10)
+        depth_spin.setValue(self.max_load_depth)
+        depth_spin.setFixedSize(35, 20)
+        depth_spin.setStyleSheet("font-size: 9px; padding: 0px;")
+        depth_spin.setToolTip("Select how many levels to load into tree")
+        depth_spin.valueChanged.connect(self.apply_load_depth)
+        header_layout.addWidget(depth_spin)
+        self.depth_spin = depth_spin
+        
+        # Add level buttons (limited by max_level_buttons setting)
         level_label = QLabel("Lvl:")  # Shortened label
         level_label.setStyleSheet("font-size: 9px;")
         header_layout.addWidget(level_label)
-        for level in range(1, max_depth + 1):
+        num_buttons = min(max_depth, self.max_level_buttons)
+        for level in range(1, num_buttons + 1):
             btn = QPushButton(str(level))
             btn.setFixedSize(22, 20)  # Smaller buttons
             btn.setStyleSheet("font-size: 9px; padding: 1px; background-color: #505050;")
-            btn.clicked.connect(lambda checked, l=level: self.collapse_level(l))
+            btn.clicked.connect(lambda checked, l=level: self._handle_level_button(l))
             header_layout.addWidget(btn)
             self.level_buttons.append(btn)
         
@@ -281,6 +510,46 @@ class XmlTreeWidget(QTreeWidget):
         
         return header_widget
     
+    def apply_load_depth(self, depth):
+        """Apply the selected load depth (expand/collapse)"""
+        self.max_load_depth = depth
+        self.setUpdatesEnabled(False)
+        self.expand_to_level(depth)
+        self.setUpdatesEnabled(True)
+
+    def _handle_level_button(self, level):
+        """Handle level button click"""
+        # If requested level is deeper than current load depth, update load depth first.
+        # This ensures nodes are expanded/loaded to the requested level.
+        if hasattr(self, 'depth_spin') and self.depth_spin:
+            current_depth = self.depth_spin.value()
+            if level > current_depth:
+                # Update spinner without triggering its signal to avoid double work/flicker
+                self.depth_spin.blockSignals(True)
+                self.depth_spin.setValue(level)
+                self.depth_spin.blockSignals(False)
+                
+                # Manually update internal state
+                self.max_load_depth = level
+                
+                # Force tree rebuild from current editor content
+                # This ensures that even if lazy nodes are present, they are properly re-evaluated
+                # and expanded to the new depth.
+                try:
+                    main_window = self.window()
+                    if hasattr(main_window, 'xml_editor'):
+                        content = main_window.xml_editor.get_content()
+                        # Use populate_tree to rebuild. 
+                        # Passing show_progress=True to show user something is happening.
+                        self.populate_tree(content, show_progress=True)
+                except Exception as e:
+                    print(f"Error forcing rebuild: {e}")
+                
+                return
+
+        # Otherwise standard collapse behavior
+        self.collapse_level(level)
+
     def collapse_level(self, level):
         """Collapse all items at specific level"""
         def collapse_items_at_level(item, current_level):
@@ -316,86 +585,255 @@ class XmlTreeWidget(QTreeWidget):
             root_item = self.topLevelItem(i)
             expand_items_to_level(root_item, 1)
     
-    def populate_tree(self, xml_content: str, show_progress=True):
+    def populate_tree(self, xml_content: str, show_progress=True, file_path: str = None, force_async=False):
         """Populate tree with XML structure"""
         self.clear()
-        service = XmlService()
+        service = getattr(self, '_xml_service', None) or XmlService()
+        self._xml_service = service  # Ensure service is available for async callback
         
         # Quick Win #1: Disable visual updates during tree building (30-50% faster)
         self.setUpdatesEnabled(False)
         
+        # Try to load from cache first if file path is available
+        if file_path and not force_async:
+            try:
+                cached_root = service.load_tree_cache(file_path)
+                if cached_root:
+                    self._add_tree_items_lazy_from_node(cached_root)
+                    
+                    # Create header with level buttons
+                    max_depth = self._calculate_max_depth(cached_root)
+                    if max_depth > 0:
+                        self.create_level_buttons(max_depth)
+                    
+                    # Expand to selected depth
+                    self.expand_to_level(self.max_load_depth)
+                    
+                    # Apply leaf hiding
+                    self.apply_hide_leaves_filter()
+                    self.setUpdatesEnabled(True)
+                    if self.status_label:
+                        self.status_label.setText("Loaded from cache")
+                    return
+            except Exception as e:
+                print(f"Cache load failed: {e}")
+
         # Progress tracking
         progress_dialog = None
         
-        # For large files, use a more memory-efficient approach
-        if len(xml_content) > 1024 * 1024:  # 1MB threshold
+        # Optimization: If file_path is provided and lxml is available, use direct loading (fast)
+        # Bypassing the thread worker which might not handle file paths/encodings as well
+        use_fast_path = False
+        if file_path and not force_async:
+             try:
+                 from xml_service import LXML_AVAILABLE
+                 if LXML_AVAILABLE:
+                     use_fast_path = True
+             except ImportError:
+                 pass
+
+        if (len(xml_content) > 1024 * 1024 and not use_fast_path) or force_async:
+            progress_dialog = None
             if show_progress:
-                # Create progress dialog
                 progress_dialog = QProgressBar()
-                progress_dialog.setRange(0, 0)  # Indeterminate progress
+                progress_dialog.setRange(0, 0)
                 progress_dialog.setTextVisible(True)
-                progress_dialog.setFormat("Building tree for large file...")
-                
-                # Add to status bar temporarily
+                progress_dialog.setFormat("Parsing XML in background...")
                 main_window = self.window()
                 if hasattr(main_window, 'status_bar'):
                     main_window.status_bar.addWidget(progress_dialog)
                     QApplication.processEvents()
-            
             if self.status_label:
-                self.status_label.setText("Building tree for large file...")
+                self.status_label.setText("Parsing lazy tree in background...")
                 QApplication.processEvents()
-            
-            # Parse XML incrementally
-            try:
-                import xml.etree.ElementTree as ET
-                parser = ET.XMLParser(target=ET.TreeBuilder(), encoding='utf-8')
-                parser.feed(xml_content.encode('utf-8'))
-                root = parser.close()
-                
-                # Build tree incrementally
-                root_node = service._element_to_tree_node(root)
-                
-                # Add items to tree with progress updates
-                if root_node:
-                    self._add_tree_items_large(None, root_node)
-                    self.expandToDepth(2)  # Only expand first 2 levels for large files
-                    # Apply leaf hiding after population
-                    self.apply_hide_leaves_filter()
-                    
-                    if self.status_label:
-                        self.status_label.setText("Large file loaded successfully")
-                
-            except Exception as e:
-                QMessageBox.warning(self, "Large File Warning", 
-                                  f"Large file loaded but tree building failed: {str(e)}\n"
-                                  f"The file content is available in the editor.")
-            finally:
-                # Remove progress dialog
-                if progress_dialog:
-                    main_window = self.window()
-                    if hasattr(main_window, 'status_bar'):
-                        main_window.status_bar.removeWidget(progress_dialog)
-                    progress_dialog.deleteLater()
-                # Re-enable updates after large file processing
-                self.setUpdatesEnabled(True)
+            worker = XmlParseWorker(xml_content, service)
+            worker.parsed.connect(lambda root: self._finish_lazy_load(root, xml_content, progress_dialog))
+            worker.start()
+            # Keep reference to worker to prevent garbage collection
+            self._parse_worker = worker
         else:
-            # Normal processing for smaller files
-            root_node = service.build_xml_tree(xml_content)
+            # Normal processing for smaller files (or fast path for large files)
+            root_node = service.build_xml_tree(xml_content, file_path=file_path)
             
             if root_node:
-                self._add_tree_items(None, root_node)
-                self.expandAll()
+                # Save to cache if file path is available
+                if file_path:
+                    service.save_tree_cache(file_path, root_node)
+
+                # Always use lazy population for better performance and consistency
+                self._add_tree_items_lazy_from_node(root_node)
                 
                 # Calculate max depth and create level buttons
                 max_depth = self._calculate_max_depth(root_node)
                 if max_depth > 0:
                     self.create_level_buttons(max_depth)
+                
+                # Expand to selected depth instead of ExpandAll
+                self.expand_to_level(self.max_load_depth)
+
                 # Apply leaf hiding after population
                 self.apply_hide_leaves_filter()
                 # Re-enable updates after normal file processing
                 self.setUpdatesEnabled(True)
+
+    def _on_item_expanded(self, item):
+        try:
+            # Handle "Load more" loader expansion for node-based lazy loading
+            if getattr(item, 'is_loader_node', False):
+                parent_item = item.parent()
+                if parent_item is None:
+                    return
+                
+                children_list = getattr(item, 'children_list', [])
+                offset = getattr(item, 'loader_offset', 0)
+                
+                try:
+                    parent_item.removeChild(item)
+                except Exception:
+                    pass
+                
+                self._expand_children_chunk_from_node(parent_item, children_list, offset)
+                return
+
+            # Handle lazy expansion for pre-built XmlTreeNode structure (fast path)
+            if getattr(item, 'lazy_loaded_from_node', None) is False:
+                node = getattr(item, 'xml_node', None)
+                if node:
+                    # Remove placeholder
+                    if item.childCount() > 0 and getattr(item.child(0), 'is_placeholder', False):
+                        item.removeChild(item.child(0))
+                    
+                    self._expand_children_chunk_from_node(item, node.children, 0)
+                    item.lazy_loaded_from_node = True
+                return
+
+            # Handle "Load more" loader expansion for element-based lazy loading
+            if getattr(item, 'is_loader', False):
+                parent_item = item.parent()
+                if parent_item is None:
+                    return
+                elem = getattr(parent_item, 'xml_element', None)
+                node = getattr(parent_item, 'xml_node', None)
+                if elem is None or node is None:
+                    return
+                offset = getattr(item, 'loader_offset', 0)
+                try:
+                    parent_item.removeChild(item)
+                except Exception:
+                    pass
+                self._expand_children_chunk(parent_item, elem, node, offset)
+                return
+
+            if getattr(item, 'lazy_loaded', False):
+                return
+            elem = getattr(item, 'xml_element', None)
+            node = getattr(item, 'xml_node', None)
+            if elem is None or node is None:
+                return
+            # Remove simple placeholder if present
+            while item.childCount() > 0:
+                c = item.child(0)
+                try:
+                    if getattr(c, 'is_placeholder', False):
+                        item.removeChild(c)
+                    else:
+                        break
+                except Exception:
+                    break
+            # Expand first chunk
+            self._expand_children_chunk(item, elem, node, getattr(item, 'load_offset', 0))
+        except Exception:
+            pass
+
+    def _expand_children_chunk(self, parent_item, elem, node, offset=0, max_children=500):
+        try:
+            tag_counts = {}
+            children = list(elem)
+            end = min(offset + max_children, len(children))
+            processed = 0
+            for i in range(offset, end):
+                child = children[i]
+                cnt = tag_counts.get(child.tag, 0) + 1
+                tag_counts[child.tag] = cnt
+                child_node = self._xml_service._element_to_shallow_node_with_lines(child, self._xml_lines, node.path, node.line_number, cnt, self._xml_line_index)
+                it = QTreeWidgetItem()
+                it.setText(0, self.compute_display_name(child_node, child))
+                it.setText(1, self._truncate_value(child_node.value) if child_node.value else "")
+                it.xml_node = child_node
+                it.xml_element = child
+                it.lazy_loaded = False
+                parent_item.addChild(it)
+                if len(child):
+                    ph = QTreeWidgetItem()
+                    ph.setText(0, "...")
+                    ph.is_placeholder = True
+                    it.addChild(ph)
+                processed += 1
+                if processed %6 == 0:
+                    QApplication.processEvents()
+            # Add loader if more children remain
+            if end < len(children):
+                loader = QTreeWidgetItem()
+                loader.setText(0, f"Load more... ({len(children) - end} remaining)")
+                loader.is_loader = True
+                loader.loader_offset = end
+                parent_item.addChild(loader)
+            else:
+                parent_item.lazy_loaded = True
+            parent_item.load_offset = end
+        except Exception:
+            pass
     
+    def _add_tree_items_lazy_from_node(self, root_node):
+        """Add top level item and setup lazy loading from existing XmlTreeNode structure"""
+        item = QTreeWidgetItem()
+        item.setText(0, self.compute_display_name(root_node))
+        item.setText(1, self._truncate_value(root_node.value) if root_node.value else "")
+        item.xml_node = root_node
+        item.lazy_loaded_from_node = False 
+        
+        self.addTopLevelItem(item)
+        
+        if root_node.children:
+            placeholder = QTreeWidgetItem()
+            placeholder.setText(0, "...")
+            placeholder.is_placeholder = True
+            item.addChild(placeholder)
+        
+        item.setExpanded(True) # Expand root
+        self.setUpdatesEnabled(True)
+
+    def _expand_children_chunk_from_node(self, parent_item, children_list, offset=0, max_children=100):
+        """Expand children from XmlTreeNode list in chunks"""
+        try:
+            end = min(offset + max_children, len(children_list))
+            
+            for i in range(offset, end):
+                child_node = children_list[i]
+                child_item = QTreeWidgetItem()
+                child_item.setText(0, self.compute_display_name(child_node))
+                child_item.setText(1, self._truncate_value(child_node.value) if child_node.value else "")
+                child_item.xml_node = child_node
+                child_item.lazy_loaded_from_node = False
+                
+                parent_item.addChild(child_item)
+                
+                if child_node.children:
+                    ph = QTreeWidgetItem()
+                    ph.setText(0, "...")
+                    ph.is_placeholder = True
+                    child_item.addChild(ph)
+            
+            if end < len(children_list):
+                loader = QTreeWidgetItem()
+                loader.setText(0, f"Load more... ({len(children_list) - end} remaining)")
+                loader.is_loader_node = True # Distinguish from other loader
+                loader.loader_offset = end
+                loader.children_list = children_list # Store reference to list
+                parent_item.addChild(loader)
+        except Exception as e:
+            print(f"Error expanding children chunk: {e}")
+
     def _calculate_max_depth(self, xml_node, current_depth=1):
         """Calculate maximum depth of XML tree"""
         max_depth = current_depth
@@ -428,38 +866,69 @@ class XmlTreeWidget(QTreeWidget):
             for child in reversed(current_xml_node.children):
                 stack.append((item, child, current_xml_node))
     
-    def _add_tree_items_large(self, parent_item, xml_node, parent_node=None, max_children=100):
+    def _add_tree_items_large(self, parent_item, xml_node, parent_node=None, max_children=50):
         """Add tree items for large files with performance optimizations"""
-        item = QTreeWidgetItem()
-        # Compute display name based on toggle
-        item.setText(0, self.compute_display_name(xml_node))
-        item.setText(1, self._truncate_value(xml_node.value) if xml_node.value else "")
-        item.xml_node = xml_node
-        item.parent_node = parent_node
+        # Use iterative approach with batching to avoid deep recursion and allow UI updates
+        stack = [(parent_item, xml_node, parent_node, 0)]  # (parent, node, parent_node, depth)
+        items_processed = 0
+        batch_size = 25  # Process 25 items before allowing UI update (reduced for better responsiveness)
+        max_depth = 2  # Only expand first 2 levels for large files (reduced from 3)
+        max_items = 1000  # Maximum total items to process (safety limit)
         
-        if parent_item is None:
-            self.addTopLevelItem(item)
-        else:
-            parent_item.addChild(item)
+        while stack and items_processed < max_items:
+            current_parent_item, current_xml_node, current_parent_node, depth = stack.pop()
+            
+            item = QTreeWidgetItem()
+            # Compute display name based on toggle
+            item.setText(0, self.compute_display_name(current_xml_node))
+            item.setText(1, self._truncate_value(current_xml_node.value) if current_xml_node.value else "")
+            item.xml_node = current_xml_node
+            item.parent_node = current_parent_node
+            
+            if current_parent_item is None:
+                self.addTopLevelItem(item)
+            else:
+                current_parent_item.addChild(item)
+            
+            # For large files, limit the number of children processed initially
+            # Also limit depth to avoid excessive tree size
+            if depth < max_depth:
+                children_to_process = current_xml_node.children[:max_children]
+                
+                # Add children to stack in reverse order for correct processing
+                for child in reversed(children_to_process):
+                    stack.append((item, child, current_xml_node, depth + 1))
+                
+                # Add placeholder if there are more children
+                if len(current_xml_node.children) > max_children:
+                    placeholder = QTreeWidgetItem()
+                    placeholder.setText(0, f"... ({len(current_xml_node.children) - max_children} more items)")
+                    placeholder.setForeground(0, QColor("gray"))
+                    item.addChild(placeholder)
+            
+            # Periodically allow UI updates
+            items_processed += 1
+            if items_processed % batch_size == 0:
+                QApplication.processEvents()
         
-        # For large files, limit the number of children processed initially
-        children_to_process = xml_node.children[:max_children]
-        
-        for child in children_to_process:
-            self._add_tree_items_large(item, child, xml_node, max_children)
-        
-        # Add placeholder if there are more children
-        if len(xml_node.children) > max_children:
-            placeholder = QTreeWidgetItem()
-            placeholder.setText(0, f"... ({len(xml_node.children) - max_children} more items)")
-            placeholder.setForeground(0, QColor("gray"))
-            item.addChild(placeholder)
+        # If we hit the max items limit, add a warning
+        if items_processed >= max_items and stack:
+            warning_item = QTreeWidgetItem()
+            warning_item.setText(0, f"Tree truncated at {max_items} items for performance")
+            warning_item.setText(1, "Use editor to view full content")
+            warning_item.setForeground(0, QColor("orange"))
+            self.addTopLevelItem(warning_item)
     
     def keyPressEvent(self, event):
         """Handle key press events for tree view"""
         # Check for F3 (Find Next)
         if event.key() == Qt.Key.Key_F3 and event.modifiers() == Qt.KeyboardModifier.NoModifier:
             self.window().find_next()
+            event.accept()
+            return
+        # Check for Shift+F3 (Find Previous)
+        if event.key() == Qt.Key.Key_F3 and event.modifiers() == Qt.KeyboardModifier.ShiftModifier:
+            self.window().find_previous()
             event.accept()
             return
         # Delete: hide current node recursively (visual filter only)
@@ -469,6 +938,22 @@ class XmlTreeWidget(QTreeWidget):
                 self.hide_item_recursively(current)
                 if self.status_label:
                     self.status_label.setText("Hidden selected node (recursive)")
+            event.accept()
+            return
+
+        # Ctrl+Delete: Delete XML Block (Model change)
+        if event.key() == Qt.Key.Key_Delete and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            current = self.currentItem()
+            if current:
+                 self.delete_node_requested.emit(current.xml_node)
+            event.accept()
+            return
+            
+        # Ctrl+/: Hide XML Block (Comment out - Model change)
+        if event.key() == Qt.Key.Key_Slash and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            current = self.currentItem()
+            if current:
+                 self.hide_node_requested.emit(current.xml_node)
             event.accept()
             return
         
@@ -489,12 +974,210 @@ class XmlTreeWidget(QTreeWidget):
             self.viewport().update()
         except Exception as e:
             print(f"hide_item_recursively error: {e}")
+    
+    def set_search_filter(self, search_text: str):
+        """Filter tree items by search text"""
+        self.search_filter_text = search_text.lower().strip()
+        self.search_matches.clear()
+        
+        if not self.search_filter_text:
+            # Clear filter - show all items
+            self._show_all_items()
+            if self.status_label:
+                self.status_label.setText("Search cleared")
+            return
+        
+        # Find all matching items
+        iterator = QTreeWidgetItemIterator(self)
+        while iterator.value():
+            item = iterator.value()
+            if item and self._item_matches_search(item):
+                self.search_matches.append(item)
+            iterator += 1
+        
+        # Apply filter visibility
+        self._apply_search_filter()
+        
+        # Update status
+        if self.status_label:
+            self.status_label.setText(f"Found {len(self.search_matches)} matches")
+    
+    def _item_matches_search(self, item) -> bool:
+        """Check if item matches search text"""
+        if not self.search_filter_text:
+            return False
+        
+        # Check element name
+        element_text = item.text(0).lower()
+        if self.search_filter_text in element_text:
+            return True
+        
+        # Check value
+        value_text = item.text(1).lower()
+        if self.search_filter_text in value_text:
+            return True
+        
+        # Check xml_node attributes if available
+        if hasattr(item, 'xml_node') and item.xml_node:
+            node = item.xml_node
+            # Check tag
+            if hasattr(node, 'tag') and self.search_filter_text in node.tag.lower():
+                return True
+            # Check attributes
+            if hasattr(node, 'attributes') and node.attributes:
+                for key, value in node.attributes.items():
+                    if self.search_filter_text in key.lower() or self.search_filter_text in str(value).lower():
+                        return True
+        
+        return False
+    
+    def _apply_search_filter(self):
+        """Apply search filter visibility to all items"""
+        if not self.search_filter_text:
+            return
+        
+        # First hide all items
+        iterator = QTreeWidgetItemIterator(self)
+        while iterator.value():
+            item = iterator.value()
+            if item:
+                item.setHidden(True)
+            iterator += 1
+        
+        # Show matching items and their ancestors
+        for match_item in self.search_matches:
+            # Show the matching item
+            match_item.setHidden(False)
+            
+            # Show all ancestors
+            parent = match_item.parent()
+            while parent:
+                parent.setHidden(False)
+                parent.setExpanded(True)  # Expand to show the match
+                parent = parent.parent()
+        
+        self.viewport().update()
+    
+    def _show_all_items(self):
+        """Show all items (clear search filter)"""
+        iterator = QTreeWidgetItemIterator(self)
+        while iterator.value():
+            item = iterator.value()
+            if item:
+                # Respect hide_leaves filter
+                is_leaf = item.childCount() == 0
+                item.setHidden(self.hide_leaves_enabled and is_leaf)
+            iterator += 1
+        self.viewport().update()
+
+    def navigate_node_down(self):
+        """Navigate to the next node in the tree."""
+        current = self.currentItem()
+        if not current:
+            # If no selection, select first item
+            if self.topLevelItemCount() > 0:
+                top = self.topLevelItem(0)
+                if top:
+                    self.setCurrentItem(top)
+                    self.scrollToItem(top)
+                    self._on_item_clicked(top, 0)
+            return
+
+        next_item = self.itemBelow(current)
+        if next_item:
+            self.setCurrentItem(next_item)
+            self.scrollToItem(next_item)
+            self._on_item_clicked(next_item, 0)
+
+    def navigate_node_up(self):
+        """Navigate to the previous node in the tree."""
+        current = self.currentItem()
+        if not current:
+            return
+
+        prev_item = self.itemAbove(current)
+        if prev_item:
+            self.setCurrentItem(prev_item)
+            self.scrollToItem(prev_item)
+            self._on_item_clicked(prev_item, 0)
+    
+class XmlParseWorker(QThread):
+    parsed = pyqtSignal(object)
+
+    def __init__(self, xml_content, service):
+        super().__init__()
+        self.xml_content = xml_content
+        self.service = service
+
+    def run(self):
+        try:
+            # Strip BOM if present
+            if self.xml_content and self.xml_content.startswith('\ufeff'):
+                self.xml_content = self.xml_content[1:]
+                
+            # Use build_xml_tree for lxml support instead of raw parse_xml
+            # This ensures we get line numbers and robust parsing
+            root_node = self.service.build_xml_tree(self.xml_content)
+            
+            # Extract the raw element from the node if successful
+            root = None
+            if root_node:
+                # Re-parse to get raw element if needed, or modify build_xml_tree to return both
+                # For now, we trust build_xml_tree to handle the parsing
+                # But _finish_lazy_load expects a raw element or compatible object
+                # Let's check if we can get the raw element
+                
+                # Actually, for lazy loading, we often need the raw element for further traversal
+                # If build_xml_tree used lxml, we don't have the raw element easily available unless we re-parse
+                # So let's try direct parsing first as the original code did, but with BOM handling
+                
+                # Revert to direct parse to match original logic, but keep BOM fix
+                root = self.service.parse_xml(self.xml_content)
+                
+            self.parsed.emit(root)
+        except Exception as e:
+            print(f"Worker parse error: {e}")
+            self.parsed.emit(None)
+
+
+class AutoCloseWorker(QThread):
+    """Worker thread for auto-closing tags"""
+    finished = pyqtSignal(str, bool)
+
+    def __init__(self, xml_content, service):
+        super().__init__()
+        self.xml_content = xml_content
+        self.service = service
+
+    def run(self):
+        try:
+            fixed_content = self.service.auto_close_tags(self.xml_content)
+            modified = (fixed_content != self.xml_content)
+            self.finished.emit(fixed_content, modified)
+        except Exception:
+            self.finished.emit(self.xml_content, False)
+
+
+class ProgressPopup(QWidget):
+    """Floating progress popup"""
+    def __init__(self, text, parent=None):
+        super().__init__(parent, Qt.WindowType.ToolTip)
+        layout = QHBoxLayout()
+        layout.setContentsMargins(10, 5, 10, 5)
+        self.label = QLabel(text)
+        self.label.setStyleSheet("color: white; font-weight: bold;")
+        layout.addWidget(self.label)
+        self.setLayout(layout)
+        self.setStyleSheet("background-color: #333; border: 1px solid #555; border-radius: 4px;")
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
 
 class XmlEditorWidget(QTextEdit):
     """Custom text editor for XML with syntax highlighting"""
     content_changed = pyqtSignal()
     cursor_position_changed = pyqtSignal(int, int)
+    fragment_editor_requested = pyqtSignal()
+    modification_changed = pyqtSignal(bool)
     
     def __init__(self):
         super().__init__()
@@ -503,21 +1186,130 @@ class XmlEditorWidget(QTextEdit):
         # Accept drag-and-drop for opening files
         self.setAcceptDrops(True)
         
+        # Flags
+        self.enable_occurrence_highlighting = True
+        
         # Set up syntax highlighter
         self.highlighter = XmlHighlighter(self.document())
         
         # Track folded ranges as (start_line, end_line) tuples, 1-based inclusive
         self._folded_ranges = []
-
+        
+        # Bookmarks for this editor {line_number: description}
+        self.bookmarks = {}
+        # Numbered bookmarks for this editor {digit: line_number}
+        self.numbered_bookmarks = {}
+        
+        # File path associated with this editor
+        self.file_path = None
+        
+        # Zip source info if file is from a zip archive
+        # Format: {'zip_path': str, 'arc_name': str, 'temp_dir': str}
+        self.zip_source = None
+        
+        # Line number widget
+        self.line_number_widget = LineNumberWidget(self)
+        self.line_number_widget.hide()  # Hidden by default
+        
         # Connect signals
         self.textChanged.connect(self.content_changed)
+        self.document().modificationChanged.connect(self.modification_changed.emit)
         self.cursorPositionChanged.connect(self._on_cursor_changed)
         # Ensure content edits do not leave stale folded state
         self.textChanged.connect(self._on_content_edited_unfold_all)
+        # Highlight all occurrences of selected text
+        self.selectionChanged.connect(self.highlight_all_occurrences)
+        
+        # Update line numbers on changes
+        self.textChanged.connect(self._update_line_number_width)
+        self.verticalScrollBar().valueChanged.connect(self.line_number_widget.update)
         
         # Set up tab behavior
         self.setTabStopDistance(40)  # 4 spaces
     
+    def set_line_numbers_visible(self, visible: bool):
+        """Show or hide line numbers"""
+        if visible:
+            self.line_number_widget.show()
+            self._update_line_number_width()
+        else:
+            self.line_number_widget.hide()
+            self.setViewportMargins(0, 0, 0, 0)
+    
+    def _update_line_number_width(self):
+        """Update the viewport margins to make room for line numbers"""
+        if self.line_number_widget.isVisible():
+            width = self.line_number_widget.calculate_width()
+            self.setViewportMargins(width, 0, 0, 0)
+    
+    def resizeEvent(self, event):
+        """Update line number widget geometry on resize"""
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self.line_number_widget.setGeometry(
+            cr.left(), cr.top(), 
+            self.line_number_widget.calculate_width(), 
+            cr.height()
+        )
+
+    def contextMenuEvent(self, event):
+        """Custom context menu with fragment editor option."""
+        menu = self.createStandardContextMenu()
+        menu.addSeparator()
+        
+        fragment_action = menu.addAction("Open Selected Fragment in New Window")
+        fragment_action.setShortcut("F8")
+        fragment_action.triggered.connect(self.fragment_editor_requested.emit)
+        
+        menu.exec(event.globalPos())
+    
+    def highlight_all_occurrences(self):
+        """Highlight all occurrences of the currently selected text."""
+        try:
+            # Check if feature is enabled
+            if not self.enable_occurrence_highlighting:
+                # Clear existing selections if any (except standard selection)
+                # But we can't easily distinguish. 
+                # Ideally, we just don't add new ones. 
+                # If we want to clear old ones, we should do it when disabling.
+                return
+
+            extra_selections = []
+            
+            # Preserve existing extra selections (e.g. current line highlight if any)
+            # Note: If we had other permanent selections, we might want to keep them.
+            # For now, we assume we control the extra selections or want to clear them.
+            # If we want to be safe, we could copy self.extraSelections() but filter out previous highlights.
+            # simpler approach: just rebuild.
+            
+            cursor = self.textCursor()
+            if cursor.hasSelection():
+                selected_text = cursor.selectedText()
+                # Only highlight if length > 1 to avoid flashing on single chars
+                if len(selected_text) > 1:
+                    # Use a distinct color for occurrence highlighting
+                    color = QColor(Qt.GlobalColor.yellow)
+                    color.setAlpha(100) # Semi-transparent
+                    
+                    # Search entire document
+                    doc = self.document()
+                    search_cursor = QTextCursor(doc)
+                    
+                    while True:
+                        search_cursor = doc.find(selected_text, search_cursor)
+                        if search_cursor.isNull():
+                            break
+                        
+                        selection = QTextEdit.ExtraSelection()
+                        selection.format.setBackground(color)
+                        selection.cursor = search_cursor
+                        extra_selections.append(selection)
+            
+            self.setExtraSelections(extra_selections)
+            
+        except Exception:
+            pass
+
     def _on_cursor_changed(self):
         """Handle cursor position change"""
         cursor = self.textCursor()
@@ -541,35 +1333,51 @@ class XmlEditorWidget(QTextEdit):
         """Set editor content"""
         self.setPlainText(content)
 
+
     # --- Folding helpers ---
     def fold_lines(self, start_line_one_based: int, end_line_one_based: int):
         """Fold by hiding inner lines between start and end (inclusive lines, inner only)."""
+        self.fold_multiple_lines([(start_line_one_based, end_line_one_based)])
+
+    def fold_multiple_lines(self, ranges: list):
+        """Fold multiple ranges efficiently."""
         try:
-            if start_line_one_based <= 0 or end_line_one_based <= 0:
-                return
-            if end_line_one_based <= start_line_one_based:
-                return
             doc = self.document()
-            start = max(0, start_line_one_based - 1)
-            end = max(0, end_line_one_based - 1)
-            # Hide inner blocks, keep boundary lines visible
-            blk = doc.findBlockByNumber(start + 1)
-            while blk.isValid() and blk.blockNumber() < end:
+            modified = False
+            
+            for start_line_one_based, end_line_one_based in ranges:
+                if start_line_one_based <= 0 or end_line_one_based <= 0:
+                    continue
+                if end_line_one_based <= start_line_one_based:
+                    continue
+                    
+                start = max(0, start_line_one_based - 1)
+                end = max(0, end_line_one_based - 1)
+                
+                # Hide inner blocks and the closing line (to avoid empty space/dangling closing tag)
+                # Range is [start + 1, end]
+                blk = doc.findBlockByNumber(start + 1)
+                while blk.isValid() and blk.blockNumber() <= end:
+                    try:
+                        if blk.isVisible():
+                            blk.setVisible(False)
+                            modified = True
+                    except Exception:
+                        break
+                    blk = blk.next()
+                    
+                rng = (start_line_one_based, end_line_one_based)
+                if rng not in self._folded_ranges:
+                    self._folded_ranges.append(rng)
+            
+            if modified:
                 try:
-                    blk.setVisible(False)
+                    doc.documentLayout().update()
+                    self.viewport().update()
                 except Exception:
-                    break
-                blk = blk.next()
-            try:
-                doc.documentLayout().update()
-                self.viewport().update()
-            except Exception:
-                pass
-            rng = (start_line_one_based, end_line_one_based)
-            if rng not in self._folded_ranges:
-                self._folded_ranges.append(rng)
+                    pass
         except Exception as e:
-            print(f"Fold error: {e}")
+            print(f"Fold multiple error: {e}")
 
     def unfold_lines(self, start_line_one_based: int, end_line_one_based: int):
         """Unfold by showing previously hidden inner lines between start and end."""
@@ -580,11 +1388,11 @@ class XmlEditorWidget(QTextEdit):
             start = max(0, start_line_one_based - 1)
             end = max(0, end_line_one_based - 1)
             blk = doc.findBlockByNumber(start + 1)
-            while blk.isValid() and blk.blockNumber() < end:
+            while blk.isValid() and blk.blockNumber() <= end:
                 try:
                     blk.setVisible(True)
-                except Exception:
-                    break
+                except Exception as e:
+                    print(f"Error unfolding block {blk.blockNumber()}: {e}")
                 blk = blk.next()
             try:
                 doc.documentLayout().update()
@@ -607,8 +1415,8 @@ class XmlEditorWidget(QTextEdit):
             while blk.isValid():
                 try:
                     blk.setVisible(True)
-                except Exception:
-                    break
+                except Exception as e:
+                    print(f"Error making block {blk.blockNumber()} visible: {e}")
                 blk = blk.next()
             try:
                 doc.documentLayout().update()
@@ -654,9 +1462,37 @@ class XmlEditorWidget(QTextEdit):
                 self._delete_selected_lines()
                 event.accept()
                 return
-            # Ctrl+/ : toggle line comment "//" at beginning
+            # Ctrl+/ : toggle comment (context sensitive)
             if event.key() == Qt.Key.Key_Slash and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-                self._toggle_line_comments(prefix="//")
+                try:
+                    self.window().toggle_comment()
+                except Exception:
+                    # Fallback to default line comment if window method fails
+                    self._toggle_line_comments(prefix="//")
+                event.accept()
+                return
+            # Ctrl+] : Jump to matching closing tag
+            if event.key() == Qt.Key.Key_BracketRight and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+                try:
+                    self.window().jump_to_matching_tag('next_close')
+                except Exception as e:
+                    print(f"Jump matching tag error: {e}")
+                event.accept()
+                return
+            # Ctrl+[ : Jump to matching opening tag
+            if event.key() == Qt.Key.Key_BracketLeft and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+                try:
+                    self.window().jump_to_matching_tag('prev_open')
+                except Exception as e:
+                    print(f"Jump matching tag error: {e}")
+                event.accept()
+                return
+            # Ctrl+\ : Cycle syntax language
+            if event.key() == Qt.Key.Key_Backslash and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+                try:
+                    self.window().cycle_syntax_language()
+                except Exception:
+                    pass
                 event.accept()
                 return
             # Ctrl+Shift+0: Unfold all
@@ -749,6 +1585,21 @@ class XmlEditorWidget(QTextEdit):
             self.window().find_next()
             event.accept()
             return
+        
+        # Check for Shift+F3 (Find Previous)
+        if event.key() == Qt.Key.Key_F3 and event.modifiers() == Qt.KeyboardModifier.ShiftModifier:
+            self.window().find_previous()
+            event.accept()
+            return
+
+        # Shift+F4 - Select XML content excluding border tags
+        if event.key() == Qt.Key.Key_F4 and event.modifiers() == Qt.KeyboardModifier.ShiftModifier:
+            try:
+                self.window().select_xml_node_or_parent(exclude_border_tags=True)
+            except Exception as e:
+                print(f"Shift+F4 selection error: {e}")
+            event.accept()
+            return
 
         # F4 - Select XML node near cursor; repeated press selects parent
         if event.key() == Qt.Key.Key_F4 and event.modifiers() == Qt.KeyboardModifier.NoModifier:
@@ -814,6 +1665,18 @@ class XmlEditorWidget(QTextEdit):
                 self.window().toggle_bookmark()
                 event.accept()
                 return
+
+        # Alt+1..9 - Fold level N
+        if event.modifiers() == Qt.KeyboardModifier.AltModifier:
+            key = event.key()
+            if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+                level = key - Qt.Key.Key_0
+                try:
+                    self.window().fold_by_level(level)
+                    event.accept()
+                    return
+                except Exception:
+                    pass
 
         # Alt+Arrow keys - Tree-backed navigation
         if event.modifiers() == Qt.KeyboardModifier.AltModifier:
@@ -949,6 +1812,109 @@ class XmlEditorWidget(QTextEdit):
             self.setTextCursor(cur)
         except Exception as e:
             print(f"Toggle comments error: {e}")
+
+    def toggle_block_comment(self, start_marker="<!--", end_marker="-->"):
+        """Toggle block comment around selection or current line."""
+        try:
+            cursor = self.textCursor()
+            if not cursor.hasSelection():
+                 cursor.select(QTextCursor.SelectionType.LineUnderCursor)
+            
+            text = cursor.selectedText()
+            # Normalize newlines
+            normalized_text = text.replace('\u2029', '\n')
+            
+            # Check if already commented
+            pattern = fr"^\s*{re.escape(start_marker)}[\s\S]*{re.escape(end_marker)}\s*$"
+            if re.match(pattern, normalized_text):
+                # Unwrap
+                s_idx = normalized_text.find(start_marker)
+                e_idx = normalized_text.rfind(end_marker)
+                
+                if s_idx != -1 and e_idx != -1 and e_idx > s_idx:
+                     # Extract inner content
+                     inner = normalized_text[s_idx+len(start_marker):e_idx]
+                     # Optional: trim one level of spacing if we added it: "<!-- content -->" -> "content"
+                     if inner.startswith(' ') and inner.endswith(' ') and len(inner) >= 2:
+                         inner = inner[1:-1]
+                     
+                     pre = normalized_text[:s_idx]
+                     post = normalized_text[e_idx+len(end_marker):]
+                     new_text = pre + inner + post
+                     cursor.insertText(new_text)
+            else:
+                # Wrap
+                # If text ends with newline, move it outside
+                trailing_newline = ""
+                if normalized_text.endswith('\n'):
+                    normalized_text = normalized_text[:-1]
+                    trailing_newline = "\n"
+                
+                cursor.insertText(f"{start_marker} {normalized_text} {end_marker}{trailing_newline}")
+        except Exception as e:
+            print(f"Toggle block comment error: {e}")
+
+    
+    def dragEnterEvent(self, event):
+        """Accept drag events with file URLs"""
+        try:
+            mime_data = event.mimeData()
+            if mime_data.hasUrls():
+                for url in mime_data.urls():
+                    if url.isLocalFile():
+                        file_path = url.toLocalFile()
+                        if file_path.lower().endswith((".xml", ".xsd", ".xsl", ".xslt")):
+                            event.acceptProposedAction()
+                            return
+            elif mime_data.hasText():
+                text = mime_data.text().strip()
+                if text and os.path.exists(text) and text.lower().endswith((".xml", ".xsd", ".xsl", ".xslt")):
+                    event.acceptProposedAction()
+                    return
+        except Exception as e:
+            print(f"Drag enter error: {e}")
+        event.ignore()
+    
+    def dragMoveEvent(self, event):
+        """Accept drag move events"""
+        try:
+            mime_data = event.mimeData()
+            if mime_data.hasUrls() or mime_data.hasText():
+                event.acceptProposedAction()
+                return
+        except Exception:
+            pass
+        event.ignore()
+    
+    def dropEvent(self, event):
+        """Handle file drop - open the file instead of inserting text"""
+        try:
+            mime_data = event.mimeData()
+            file_paths = []
+            
+            # Extract file paths from URLs
+            if mime_data.hasUrls():
+                for url in mime_data.urls():
+                    if url.isLocalFile():
+                        file_paths.append(url.toLocalFile())
+            elif mime_data.hasText():
+                text = mime_data.text().strip()
+                if text:
+                    file_paths.append(text)
+            
+            # Open the first valid XML file
+            for file_path in file_paths:
+                if os.path.exists(file_path) and file_path.lower().endswith((".xml", ".xsd", ".xsl", ".xslt")):
+                    main_window = self.window()
+                    if hasattr(main_window, 'open_file'):
+                        main_window.open_file(file_path)
+                    elif hasattr(main_window, '_load_file_from_path'):
+                        main_window._load_file_from_path(file_path)
+                    event.acceptProposedAction()
+                    return
+        except Exception as e:
+            print(f"Drop event error: {e}")
+        event.ignore()
     
     def contextMenuEvent(self, event):
         """Create custom context menu for text editor"""
@@ -1007,9 +1973,11 @@ class BottomPanel(QTabWidget):
         self.validation_tab = QWidget()
         self.find_tab = QWidget()
         self.bookmarks_tab = QWidget()
+        self.links_tab = QWidget()
         
         self.addTab(self.find_tab, "Find Results")
         self.addTab(self.bookmarks_tab, "Bookmarks")
+        self.addTab(self.links_tab, "Links")
         self.addTab(self.output_tab, "Output")
         self.addTab(self.validation_tab, "Validation")
 
@@ -1017,6 +1985,7 @@ class BottomPanel(QTabWidget):
         self._setup_validation_tab()
         self._setup_find_tab()
         self._setup_bookmarks_tab()
+        self._setup_links_tab()
     
     def _setup_output_tab(self):
         """Setup output tab"""
@@ -1047,12 +2016,19 @@ class BottomPanel(QTabWidget):
     def _setup_bookmarks_tab(self):
         """Setup bookmarks tab"""
         layout = QVBoxLayout()
-        # Controls for bookmark operations
+        # Controls for bookmark operations - moved to right side
         controls = QHBoxLayout()
+        controls.addStretch()  # Push buttons to the right
         btn_toggle = QPushButton("Toggle at Cursor")
         btn_next = QPushButton("Next")
         btn_prev = QPushButton("Previous")
         btn_clear = QPushButton("Clear All")
+        # Make buttons more compact
+        btn_style = "padding: 2px 6px; font-size: 9px;"
+        btn_toggle.setStyleSheet(btn_style)
+        btn_next.setStyleSheet(btn_style)
+        btn_prev.setStyleSheet(btn_style)
+        btn_clear.setStyleSheet(btn_style)
         try:
             btn_toggle.clicked.connect(lambda: self.window().toggle_bookmark())
             btn_next.clicked.connect(lambda: self.window().next_bookmark())
@@ -1063,13 +2039,31 @@ class BottomPanel(QTabWidget):
         controls.addWidget(btn_toggle)
         controls.addWidget(btn_next)
         controls.addWidget(btn_prev)
-        controls.addStretch()
         controls.addWidget(btn_clear)
         layout.addLayout(controls)
         self.bookmark_list = QListWidget()
         self.bookmark_list.setMaximumHeight(250)
+        self.bookmark_list.setStyleSheet("font-size: 9px;")  # Make list more compact
         layout.addWidget(self.bookmark_list)
         self.bookmarks_tab.setLayout(layout)
+
+    def _setup_links_tab(self):
+        """Setup links tab for XPath navigation"""
+        layout = QVBoxLayout()
+        
+        # Info label
+        info_label = QLabel("XPath Links (Ctrl+F11 to copy, F12 to navigate)")
+        info_label.setStyleSheet("font-size: 9px; color: #888;")
+        layout.addWidget(info_label)
+        
+        # Links text edit - one XPath per line
+        self.links_text = QTextEdit()
+        self.links_text.setMaximumHeight(250)
+        self.links_text.setFont(QFont("Consolas", 9))
+        self.links_text.setPlaceholderText("XPath links will appear here...\nOne link per line")
+        layout.addWidget(self.links_text)
+        
+        self.links_tab.setLayout(layout)
 
     def dragEnterEvent(self, event):
         """Accept drags that look like supported local files."""
@@ -1217,42 +2211,115 @@ class FindDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Find")
         self.setModal(False)
-        self.setFixedSize(400, 200)
+        self.setFixedSize(450, 80)
         
         layout = QVBoxLayout()
         
-        # Find input
-        find_layout = QHBoxLayout()
-        find_layout.addWidget(QLabel("Find:"))
-        self.find_input = QLineEdit()
-        find_layout.addWidget(self.find_input)
-        layout.addLayout(find_layout)
+        # Find input with history (no label)
+        input_layout = QHBoxLayout()
+        # Use QComboBox for history
+        self.find_input = QComboBox()
+        self.find_input.setEditable(True)
+        self.find_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.find_input.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.find_input.setPlaceholderText("Find...")
+        # Make line edit clearable and handle return press
+        self.find_input.lineEdit().setClearButtonEnabled(True)
+        self.find_input.lineEdit().returnPressed.connect(self.find_text)
+        input_layout.addWidget(self.find_input)
+        
+        layout.addLayout(input_layout)
         
         # Options
-        options_layout = QVBoxLayout()
-        self.case_sensitive = QCheckBox("Case sensitive")
-        self.whole_word = QCheckBox("Whole word")
-        self.use_regex = QCheckBox("Use regular expressions")
+        options_layout = QHBoxLayout()
+        self.case_sensitive = QCheckBox("Case")
+        self.case_sensitive.setToolTip("Case sensitive")
+        self.whole_word = QCheckBox("Whole")
+        self.whole_word.setToolTip("Whole word")
+        self.use_regex = QCheckBox("Regex")
+        self.use_regex.setToolTip("Use regular expressions")
         options_layout.addWidget(self.case_sensitive)
         options_layout.addWidget(self.whole_word)
         options_layout.addWidget(self.use_regex)
-        layout.addLayout(options_layout)
+        options_layout.addStretch()
+
         
         # Buttons
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | 
             QDialogButtonBox.StandardButton.Close
         )
+        button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Find")
         button_box.accepted.connect(self.find_text)
         button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
+        options_layout.addWidget(button_box)
+        layout.addLayout(options_layout)
         
         self.setLayout(layout)
+        
+        # Load search history
+        self.search_history = self._load_search_history()
+        self.find_input.addItems(self.search_history)
+        self.find_input.setCurrentIndex(-1)
+
+    def showEvent(self, event):
+        """Auto-select text on show"""
+        super().showEvent(event)
+        # Use timer to ensure selection happens after focus events
+        QTimer.singleShot(0, self._select_all)
+
+    def _select_all(self):
+        """Select all text in input"""
+        self.find_input.setFocus()
+        if self.find_input.lineEdit():
+            self.find_input.lineEdit().selectAll()
+        
+    def _load_search_history(self):
+        """Load search history from settings"""
+        try:
+            parent = self.parent()
+            if hasattr(parent, '_get_settings'):
+                settings = parent._get_settings()
+                history = settings.value('search_history', '')
+                if history:
+                    return history.split('\n')[:20]  # Keep last 20 items
+            return []
+        except Exception:
+            return []
+    
+    def _save_search_history(self, text):
+        """Save search text to history"""
+        if not text or not text.strip():
+            return
+            
+        try:
+            # Update local history list
+            if text in self.search_history:
+                self.search_history.remove(text)
+            self.search_history.insert(0, text)
+            # Keep only last 20
+            self.search_history = self.search_history[:20]
+            
+            # Update combo box
+            self.find_input.blockSignals(True)
+            self.find_input.clear()
+            self.find_input.addItems(self.search_history)
+            self.find_input.setCurrentText(text)
+            self.find_input.blockSignals(False)
+
+            parent = self.parent()
+            if hasattr(parent, '_get_settings'):
+                # Save as newline-separated string
+                settings = parent._get_settings()
+                history_str = '\n'.join(self.search_history)
+                settings.setValue('search_history', history_str)
+        except Exception as e:
+            print(f"Error saving search history: {e}")
     
     def get_search_params(self):
         """Get search parameters"""
         return {
-            'text': self.find_input.text(),
+            'text': self.find_input.currentText(),
             'case_sensitive': self.case_sensitive.isChecked(),
             'whole_word': self.whole_word.isChecked(),
             'use_regex': self.use_regex.isChecked()
@@ -1260,6 +2327,9 @@ class FindDialog(QDialog):
     
     def find_text(self):
         """Handle find button click"""
+        text = self.find_input.currentText().strip()
+        if text:
+            self._save_search_history(text)
         # Just accept the dialog - the main window will handle the search
         self.accept()
 
@@ -1486,15 +2556,19 @@ class MainWindow(QMainWindow):
     def __init__(self, file_path=None):
         super().__init__()
         self.current_file = None
+        self.current_zip_source = None  # { 'zip_path': str, 'arc_name': str, 'temp_dir': str }
         self.xml_service = XmlService()
         
         # Debug logging flag (set to True to enable treedebug.txt logging)
         self.tree_debug_enabled = False
         
         # Bookmarks functionality
-        self.bookmarks = {}  # line_number -> description
+        self._temp_bookmarks = {}  # Temporary storage until editor is active
+        self._temp_numbered_bookmarks = {} # Temporary storage until editor is active
         self.current_bookmark_index = -1
-        self.numbered_bookmarks = {}  # digit (1..9) -> line_number
+        
+        # Fragment editors tracking
+        self.fragment_editors = []
         
         # Search functionality
         self.last_search_params = None
@@ -1558,6 +2632,10 @@ class MainWindow(QMainWindow):
         self.tree_update_timer.timeout.connect(self._debounced_tree_update)
         self._pending_tree_content = None
         
+        # Auto rebuild tree flag (configurable in settings)
+        self.auto_rebuild_tree = True
+        self._tree_needs_rebuild = False  # Flag to track if tree needs manual rebuild
+        
         # Debug mode flag
         self.debug_mode = False
         
@@ -1566,15 +2644,61 @@ class MainWindow(QMainWindow):
         # Load recent files and open file if provided, otherwise open most recent
         self._load_recent_files()
         if file_path and os.path.exists(file_path):
-            self._load_file_from_path(file_path)
-            self.status_label.setText(f"Opened file: {os.path.basename(file_path)}")
-            # Hide file navigator when starting with a file provided
-            self._set_file_navigator_visible(False)
-        else:
-            self._open_most_recent_file()
-            # Hide file navigator if a recent file was auto-opened
-            if self.current_file:
+            if file_path.lower().endswith('.zip'):
+                # Defer zip opening slightly to ensure UI is fully ready
+                QTimer.singleShot(100, lambda: self._open_zip_workflow(file_path))
+            else:
+                self._load_file_from_path(file_path)
+                self.status_label.setText(f"Opened file: {os.path.basename(file_path)}")
+                # Hide file navigator when starting with a file provided
                 self._set_file_navigator_visible(False)
+        else:
+            session_path = os.path.join(os.path.expanduser("~"), ".lotus_xml_editor_session.json")
+            if os.path.exists(session_path):
+                QTimer.singleShot(0, self._restore_session)
+            else:
+                self._open_most_recent_file()
+                # Hide file navigator if a recent file was auto-opened
+                if self.current_file:
+                    self._set_file_navigator_visible(False)
+
+        # Zip support state
+        # Zip support state initialized earlier
+
+    def _get_version_string(self) -> str:
+        """Calculate version string based on max modification time of core files."""
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            files_to_check = ['main.py', 'xml_service.py']
+            max_ts = 0
+            for fname in files_to_check:
+                fpath = os.path.join(base_dir, fname)
+                if os.path.exists(fpath):
+                    ts = os.path.getmtime(fpath)
+                    if ts > max_ts:
+                        max_ts = ts
+            
+            if max_ts > 0:
+                dt = QDateTime.fromSecsSinceEpoch(int(max_ts))
+                return f"ver.{dt.toString('yyMMdd')}"
+        except Exception:
+            pass
+        return "ver.dev"
+
+    def _update_window_title(self):
+        """Update window title with current file name and version"""
+        ver_str = self._get_version_string()
+        base_title = f"Lotus Xml Editor - {ver_str}"
+        
+        if self.current_file:
+            filename = os.path.basename(self.current_file)
+            if self.current_zip_source:
+                 zip_name = os.path.basename(self.current_zip_source['zip_path'])
+                 self.setWindowTitle(f"{filename} [{zip_name}] - {base_title}")
+            else:
+                 self.setWindowTitle(f"{filename} - {base_title}")
+        else:
+            self.setWindowTitle(base_title)
 
     def _build_path_line_index(self, content: str):
         """Build path→line index using lxml.etree.sourceline if available."""
@@ -1615,10 +2739,40 @@ class MainWindow(QMainWindow):
                         tag_counters_stack = tag_counters_stack[:len(path_stack) + 1]
             self._sync_index_available = True
         except Exception as e:
-            print(f"DEBUG: lxml indexing not available or failed: {e}")
+            self._debug_print(f"DEBUG: lxml indexing not available or failed: {e}")
             self.path_line_index = {}
             self._sync_index_available = False
     
+    @property
+    def numbered_bookmarks(self):
+        """Get numbered bookmarks for the current editor"""
+        if hasattr(self, 'xml_editor') and self.xml_editor:
+            return self.xml_editor.numbered_bookmarks
+        return self._temp_numbered_bookmarks
+
+    @numbered_bookmarks.setter
+    def numbered_bookmarks(self, value):
+        """Set numbered bookmarks for the current editor"""
+        if hasattr(self, 'xml_editor') and self.xml_editor:
+            self.xml_editor.numbered_bookmarks = value
+        else:
+            self._temp_numbered_bookmarks = value
+
+    @property
+    def bookmarks(self):
+        """Get bookmarks for the current editor"""
+        if hasattr(self, 'xml_editor') and self.xml_editor:
+            return self.xml_editor.bookmarks
+        return self._temp_bookmarks
+
+    @bookmarks.setter
+    def bookmarks(self, value):
+        """Set bookmarks for the current editor"""
+        if hasattr(self, 'xml_editor') and self.xml_editor:
+            self.xml_editor.bookmarks = value
+        else:
+            self._temp_bookmarks = value
+
     def _create_menu_bar(self):
         """Create menu bar"""
         menubar = self.menuBar()
@@ -1630,6 +2784,11 @@ class MainWindow(QMainWindow):
         new_action.setShortcut("Ctrl+N")
         new_action.triggered.connect(self.new_file)
         file_menu.addAction(new_action)
+        
+        new_window_action = QAction("New Window", self)
+        new_window_action.setShortcut("Ctrl+Shift+N")
+        new_window_action.triggered.connect(self.file_new_window)
+        file_menu.addAction(new_window_action)
         
         open_action = QAction("Open...", self)
         open_action.setShortcut("Ctrl+O")
@@ -1652,6 +2811,24 @@ class MainWindow(QMainWindow):
         save_as_action.setShortcut("Ctrl+Shift+S")
         save_as_action.triggered.connect(self.save_file_as)
         file_menu.addAction(save_as_action)
+        
+        reread_action = QAction("Reread from Disk", self)
+        reread_action.setShortcut("Ctrl+R")
+        reread_action.setToolTip("Reload file from disk, discarding changes")
+        reread_action.triggered.connect(self.reread_file)
+        file_menu.addAction(reread_action)
+
+        rename_action = QAction("Rename...", self)
+        rename_action.setShortcut("Ctrl+F2")
+        rename_action.setToolTip("Rename current file on disk")
+        rename_action.triggered.connect(self.rename_file)
+        file_menu.addAction(rename_action)
+        
+        open_folder_action = QAction("Open Containing Folder", self)
+        open_folder_action.setShortcut("Alt+Shift+O")
+        open_folder_action.setToolTip("Open folder in system file explorer")
+        open_folder_action.triggered.connect(self.open_containing_folder)
+        file_menu.addAction(open_folder_action)
         
         file_menu.addSeparator()
         
@@ -1684,6 +2861,11 @@ class MainWindow(QMainWindow):
         find_next_action.setShortcut("F3")
         find_next_action.triggered.connect(self.find_next)
         edit_menu.addAction(find_next_action)
+        
+        find_previous_action = QAction("Find Previous", self)
+        find_previous_action.setShortcut("Shift+F3")
+        find_previous_action.triggered.connect(self.find_previous)
+        edit_menu.addAction(find_previous_action)
 
         # Replace actions
         replace_action = QAction("Replace...", self)
@@ -1722,6 +2904,26 @@ class MainWindow(QMainWindow):
         clear_bookmarks_action = QAction("Clear All Bookmarks", self)
         clear_bookmarks_action.triggered.connect(self.clear_bookmarks)
         edit_menu.addAction(clear_bookmarks_action)
+        
+        edit_menu.addSeparator()
+        
+        # XPath Links actions
+        copy_xpath_link_action = QAction("Copy XPath Link", self)
+        copy_xpath_link_action.setShortcut("Ctrl+F11")
+        copy_xpath_link_action.triggered.connect(self.copy_xpath_link)
+        edit_menu.addAction(copy_xpath_link_action)
+        
+        navigate_xpath_link_action = QAction("Navigate to XPath Link", self)
+        navigate_xpath_link_action.setShortcut("F12")
+        navigate_xpath_link_action.triggered.connect(self.navigate_xpath_link)
+        edit_menu.addAction(navigate_xpath_link_action)
+        
+        edit_menu.addSeparator()
+        
+        fragment_editor_action = QAction("Open Fragment Editor", self)
+        fragment_editor_action.setShortcut("F8")
+        fragment_editor_action.triggered.connect(self.open_fragment_editor)
+        edit_menu.addAction(fragment_editor_action)
         
         # XML menu
         xml_menu = menubar.addMenu("XML")
@@ -1799,8 +3001,36 @@ class MainWindow(QMainWindow):
         structure_diagram_action.triggered.connect(self.open_structure_diagram)
         xml_menu.addAction(structure_diagram_action)
 
+        # Commands menu
+        commands_menu = menubar.addMenu("Commands")
         
-        # 1C Exchange menu (Обмен с 1С)
+        encode_file_action = QAction("Encode File to Clipboard", self)
+        encode_file_action.setShortcut("Meta+Ctrl+Ins")
+        encode_file_action.setToolTip("Encode file from system clipboard to base64 text with prefix")
+        encode_file_action.triggered.connect(self._encode_file_to_clipboard)
+        commands_menu.addAction(encode_file_action)
+        
+        decode_file_action = QAction("Decode File from Clipboard", self)
+        decode_file_action.setShortcut("Meta+Shift+Ins")
+        decode_file_action.setToolTip("Decode base64 text from clipboard to file")
+        decode_file_action.triggered.connect(self._decode_file_from_clipboard)
+        commands_menu.addAction(decode_file_action)
+
+        commands_menu.addSeparator()
+
+        escape_entities_action = QAction("Escape XML Entities in Selection", self)
+        escape_entities_action.setShortcut("Ctrl+Shift+K")
+        escape_entities_action.setToolTip("Convert special characters to XML entities (safe)")
+        escape_entities_action.triggered.connect(self.escape_selection_entities)
+        commands_menu.addAction(escape_entities_action)
+
+        unescape_entities_action = QAction("Unescape XML Entities in Selection", self)
+        unescape_entities_action.setShortcut("Ctrl+Alt+U")
+        unescape_entities_action.setToolTip("Convert XML entities back to characters")
+        unescape_entities_action.triggered.connect(self.unescape_selection_entities)
+        commands_menu.addAction(unescape_entities_action)
+
+        # Help menu (Обмен с 1С)
         exchange_menu = menubar.addMenu("Обмен с 1С")
 
         # Mode toggle: Semi-automatic (checked) vs Manual (unchecked)
@@ -1840,7 +3070,74 @@ class MainWindow(QMainWindow):
 
         # View menu
         view_menu = menubar.addMenu("View")
+
+        # Spartan Mode toggle (No Sync/updates)
+        self.spartan_mode_action = QAction("Spartan Mode (No Sync/updates)", self)
+        self.spartan_mode_action.setCheckable(True)
+        self.spartan_mode_action.setToolTip("Enable for large/broken files: disables sync, tree updates, highlights")
         
+        def _on_spartan_mode_toggled(checked: bool):
+            self.spartan_mode = checked
+            # Persist flag
+            try:
+                self._save_flag('spartan_mode', checked)
+            except Exception:
+                pass
+            
+            # Apply Spartan Mode effects
+            if checked:
+                # Save current state before disabling
+                self.spartan_pre_state = {}
+                
+                if hasattr(self, 'toggle_sync_action'):
+                    self.spartan_pre_state['sync'] = self.toggle_sync_action.isChecked()
+                    self.toggle_sync_action.setChecked(False)
+                    
+                if hasattr(self, 'toggle_update_tree_view_action'):
+                    self.spartan_pre_state['update_tree'] = self.toggle_update_tree_view_action.isChecked()
+                    self.toggle_update_tree_view_action.setChecked(False)
+                    
+                if hasattr(self, 'toggle_highlight_action'):
+                    self.spartan_pre_state['highlight'] = self.toggle_highlight_action.isChecked()
+                    self.toggle_highlight_action.setChecked(False)
+                
+                # Update status
+                if hasattr(self, 'status_label') and self.status_label:
+                    self.status_label.setText("Spartan Mode enabled: Sync, Auto-updates, Highlight disabled")
+            else:
+                # Restore previous state
+                # If no pre-state (e.g. started in Spartan Mode), default to enabling standard features (Highlight, Tree)
+                restore_sync = False
+                restore_tree = True
+                restore_highlight = True
+                
+                if hasattr(self, 'spartan_pre_state'):
+                    restore_sync = self.spartan_pre_state.get('sync', False)
+                    restore_tree = self.spartan_pre_state.get('update_tree', True)
+                    restore_highlight = self.spartan_pre_state.get('highlight', True)
+                
+                if hasattr(self, 'toggle_sync_action'):
+                    self.toggle_sync_action.setChecked(restore_sync)
+                
+                if hasattr(self, 'toggle_update_tree_view_action'):
+                    self.toggle_update_tree_view_action.setChecked(restore_tree)
+                
+                if hasattr(self, 'toggle_highlight_action'):
+                    self.toggle_highlight_action.setChecked(restore_highlight)
+                
+                if hasattr(self, 'status_label') and self.status_label:
+                    self.status_label.setText("Spartan Mode disabled")
+            
+            # Update indicator
+            try:
+                self._update_flags_indicator()
+            except Exception:
+                pass
+
+        self.spartan_mode_action.toggled.connect(_on_spartan_mode_toggled)
+        view_menu.addAction(self.spartan_mode_action)
+        view_menu.addSeparator()
+
         toggle_theme_action = QAction("Toggle Dark Theme", self)
         toggle_theme_action.triggered.connect(self.toggle_theme)
         view_menu.addAction(toggle_theme_action)
@@ -1858,6 +3155,7 @@ class MainWindow(QMainWindow):
         self.toggle_bottom_panel_action = QAction("Show Bottom Panel", self)
         self.toggle_bottom_panel_action.setCheckable(True)
         self.toggle_bottom_panel_action.setChecked(False)  # Hidden by default
+        self.toggle_bottom_panel_action.setShortcut("F9")
         self.toggle_bottom_panel_action.triggered.connect(self.toggle_bottom_panel)
         view_menu.addAction(self.toggle_bottom_panel_action)
         
@@ -1891,7 +3189,7 @@ class MainWindow(QMainWindow):
                 print(f"Friendly labels toggle error: {e}")
         
         self.toggle_friendly_labels_action.toggled.connect(_on_friendly_labels_toggled)
-        view_menu.addAction(self.toggle_friendly_labels_action)
+        # view_menu.addAction(self.toggle_friendly_labels_action)
 
         # Update Tree on Tab Switch toggle in View menu (mirrors toolbar toggle)
         self.toggle_update_tree_view_action = QAction("Update Tree on Tab Switch", self)
@@ -2034,6 +3332,65 @@ class MainWindow(QMainWindow):
         multicolumn_tree_action.triggered.connect(self.open_multicolumn_tree)
         view_menu.addAction(multicolumn_tree_action)
 
+        # XML Metro Navigator
+        metro_navigator_action = QAction("XML Metro Navigator", self)
+        metro_navigator_action.setShortcut("Ctrl+M")
+        metro_navigator_action.triggered.connect(self.open_metro_navigator)
+        view_menu.addAction(metro_navigator_action)
+
+        view_menu.addSeparator()
+        
+        # Toggle Line Numbers
+        self.toggle_line_numbers_action = QAction("Show Line Numbers", self)
+        self.toggle_line_numbers_action.setCheckable(True)
+        self.toggle_line_numbers_action.setChecked(False)  # Default: off
+        self.toggle_line_numbers_action.setShortcut("Ctrl+L")
+        
+        def _on_line_numbers_toggled(checked: bool):
+            try:
+                self.apply_line_numbers_to_all_editors(checked)
+                if hasattr(self, 'status_label') and self.status_label:
+                    self.status_label.setText(f"Line numbers {'shown' if checked else 'hidden'}")
+                try:
+                    self._save_flag('show_line_numbers', checked)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Line numbers toggle error: {e}")
+        
+        self.toggle_line_numbers_action.toggled.connect(_on_line_numbers_toggled)
+        view_menu.addAction(self.toggle_line_numbers_action)
+        
+        view_menu.addSeparator()
+        
+        # Code Folding actions
+        fold_current_action = QAction("Fold Current Element", self)
+        fold_current_action.setShortcut("Ctrl+Shift+[")
+        fold_current_action.triggered.connect(self.fold_current_element)
+        view_menu.addAction(fold_current_action)
+        
+        unfold_current_action = QAction("Unfold Current Element", self)
+        unfold_current_action.setShortcut("Ctrl+Shift+]")
+        unfold_current_action.triggered.connect(self.unfold_current_element)
+        view_menu.addAction(unfold_current_action)
+        
+        unfold_all_action = QAction("Unfold All", self)
+        unfold_all_action.setShortcut("Ctrl+Shift+U")
+        unfold_all_action.triggered.connect(self.unfold_all_elements)
+        view_menu.addAction(unfold_all_action)
+        
+        view_menu.addSeparator()
+        
+        nav_up_action = QAction("Navigate Tree Up", self)
+        nav_up_action.setShortcut("F6")
+        nav_up_action.triggered.connect(lambda: self.xml_tree.navigate_node_up() if hasattr(self, 'xml_tree') else None)
+        view_menu.addAction(nav_up_action)
+        
+        nav_down_action = QAction("Navigate Tree Down", self)
+        nav_down_action.setShortcut("F7")
+        nav_down_action.triggered.connect(lambda: self.xml_tree.navigate_node_down() if hasattr(self, 'xml_tree') else None)
+        view_menu.addAction(nav_down_action)
+
         # Settings menu
         settings_menu = menubar.addMenu("Settings")
         settings_action = QAction("Preferences...", self)
@@ -2047,6 +3404,10 @@ class MainWindow(QMainWindow):
         hotkeys_action.setShortcut("F1")
         hotkeys_action.triggered.connect(self.show_hotkey_help)
         help_menu.addAction(hotkeys_action)
+        
+        about_action = QAction("About...", self)
+        about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(about_action)
     
     def _create_tool_bar(self):
         """Create tool bar"""
@@ -2062,6 +3423,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(open_btn)
         
         save_btn = QAction("Save", self)
+        save_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
         save_btn.triggered.connect(self.save_file)
         toolbar.addAction(save_btn)
         
@@ -2102,6 +3464,13 @@ class MainWindow(QMainWindow):
         #split_btn = QAction("Split XML", self)
         #split_btn.triggered.connect(self.show_split_dialog)
         #toolbar.addAction(split_btn)
+        
+        # Tree rebuild indicator (shown when auto-rebuild is disabled and tree needs update)
+        self.tree_rebuild_indicator = QLabel("⚠")
+        self.tree_rebuild_indicator.setStyleSheet("color: orange; font-size: 16px; font-weight: bold; padding: 0 5px;")
+        self.tree_rebuild_indicator.setToolTip("Tree needs rebuild - click 'Rebuild Tree' to update")
+        self.tree_rebuild_indicator.setVisible(False)
+        toolbar.addWidget(self.tree_rebuild_indicator)
         
         # Rebuild Tree button with auto-close tags
         rebuild_tree_btn = QAction("Rebuild Tree", self)
@@ -2168,7 +3537,7 @@ class MainWindow(QMainWindow):
             # Update button state
             self._update_button_state('symbols', checked)
             
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter'):
+            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
                 # Update highlighter visibility option for symbols
                 self.xml_editor.highlighter.set_visibility_options(hide_symbols=checked)
                 # Reflect state in status bar for clarity
@@ -2198,7 +3567,7 @@ class MainWindow(QMainWindow):
             # Update button state
             self._update_button_state('tags', checked)
             
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter'):
+            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
                 # Update highlighter visibility option for tags
                 self.xml_editor.highlighter.set_visibility_options(hide_tags=checked)
                 # Reflect state in status bar for clarity
@@ -2228,7 +3597,7 @@ class MainWindow(QMainWindow):
             # Update button state
             self._update_button_state('values', checked)
             
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter'):
+            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
                 # Update highlighter visibility option for values
                 self.xml_editor.highlighter.set_visibility_options(hide_values=checked)
                 # Reflect state in status bar for clarity
@@ -2330,7 +3699,7 @@ class MainWindow(QMainWindow):
         self.update_tree_toggle.toggled.connect(_on_update_tree_toggled)
 
         # Hide Leaves toggle for XML tree
-        toolbar.addSeparator()
+        # toolbar.addSeparator()
         self.toggle_hide_leaves_action = QAction("Hide Leaves", self)
         self.toggle_hide_leaves_action.setCheckable(True)
         self.toggle_hide_leaves_action.setChecked(True)
@@ -2355,7 +3724,8 @@ class MainWindow(QMainWindow):
                 print(f"Hide leaves toggle error: {e}")
 
         self.toggle_hide_leaves_action.toggled.connect(_on_hide_leaves_toggled)
-        toolbar.addAction(self.toggle_hide_leaves_action)
+        # Moved to status bar
+        # toolbar.addAction(self.toggle_hide_leaves_action)
     
     def _on_language_combo_changed(self, index: int):
         """Handle language selection changes from the toolbar combo box."""
@@ -2388,18 +3758,90 @@ class MainWindow(QMainWindow):
         """Install built-in and bundled UDL language profiles into the registry."""
         try:
             # Bundled Notepad++ UDL example, if present
-            base_dir = os.path.dirname(__file__)
-            udl_path = os.path.join(base_dir, "1C Ent_TRANS.xml")
-            if os.path.exists(udl_path):
-                ld = load_udl_xml(udl_path)
-                if ld:
-                    self.language_registry.install(ld)
+            # Check multiple locations for bundled file
+            locations = [
+                os.path.dirname(os.path.abspath(__file__)), # Dev mode
+            ]
+            if getattr(sys, 'frozen', False):
+                 # PyInstaller onedir/onefile
+                 locations.append(os.path.dirname(sys.executable))
+                 if hasattr(sys, '_MEIPASS'):
+                     locations.append(sys._MEIPASS)
+
+            found = False
+            for base_dir in locations:
+                udl_path = os.path.join(base_dir, "1C Ent_TRANS.xml")
+                if os.path.exists(udl_path):
+                    ld = load_udl_xml(udl_path)
+                    if ld:
+                        self.language_registry.install(ld)
+                        found = True
+                        break
+            
+            if not found:
+                 # Try current working directory as fallback
+                 udl_path = os.path.join(os.getcwd(), "1C Ent_TRANS.xml")
+                 if os.path.exists(udl_path):
+                     ld = load_udl_xml(udl_path)
+                     if ld:
+                         self.language_registry.install(ld)
         except Exception as e:
             print(f"Default language install error: {e}")
+
+    def open_fragment_editor(self):
+        """Open selected text in fragment editor."""
+        try:
+            editor = self.xml_editor
+            if not editor:
+                return
+            
+            cursor = editor.textCursor()
+            if not cursor.hasSelection():
+                # If no selection, check if we can select the current element using F4 logic?
+                # Or just show message.
+                QMessageBox.information(self, "Fragment Editor", "Please select XML fragment to edit.")
+                return
+
+            text = cursor.selectedText()
+            # Replace unicode paragraph separator which Qt might introduce for newlines
+            text = text.replace('\u2029', '\n') 
+            
+            dialog = FragmentEditorDialog(text, self.language_registry, parent=self)
+            dialog.setWindowFlags(Qt.WindowType.Window)  # Make it a non-modal window
+            dialog.show()  # Show non-modal dialog
+            
+            # Track dialog for persistence
+            if not hasattr(self, 'fragment_editors'):
+                self.fragment_editors = []
+            self.fragment_editors.append(dialog)
+            # Remove from list when closed
+            dialog.finished.connect(lambda result: self.fragment_editors.remove(dialog) if dialog in self.fragment_editors else None)
+            
+        except Exception as e:
+            print(f"Fragment editor error: {e}")
 
     def _apply_selected_language_to_editor(self, editor: 'XmlEditorWidget'):
         """Apply the currently selected language profile to the given editor."""
         try:
+            # Check if highlighting is enabled (Spartan Mode check)
+            highlight_enabled = True
+            if hasattr(self, 'toggle_highlight_action'):
+                highlight_enabled = self.toggle_highlight_action.isChecked()
+            
+            # Control occurrence highlighting based on master highlight switch
+            if hasattr(editor, 'enable_occurrence_highlighting'):
+                editor.enable_occurrence_highlighting = highlight_enabled
+                # If disabled, clear any existing extra selections (highlights)
+                if not highlight_enabled:
+                    editor.setExtraSelections([])
+            
+            if not highlight_enabled:
+                # Disable highlighting
+                if hasattr(editor, 'highlighter') and editor.highlighter:
+                    editor.highlighter.setDocument(None)
+                    editor.highlighter = None
+                return
+
             # Determine selection (fall back to XML)
             selected = 'XML'
             try:
@@ -2446,15 +3888,50 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         except Exception as e:
-            print(f"Apply language error: {e}")
+            print(f"Apply language error: {e}")                
+
+    def cycle_syntax_language(self):
+        """Cycle to the next available syntax language."""
+        try:
+            if hasattr(self, 'language_combo') and self.language_combo:
+                count = self.language_combo.count()
+                if count > 1:
+                    current = self.language_combo.currentIndex()
+                    next_index = (current + 1) % count
+                    self.language_combo.setCurrentIndex(next_index)
+        except Exception as e:
+            print(f"Cycle syntax language error: {e}")
+
+    def toggle_comment(self):
+        """Toggle comment based on current syntax language."""
+        try:
+            current_lang = 'XML'
+            if hasattr(self, 'language_combo') and self.language_combo:
+                current_lang = self.language_combo.currentText()
+            
+            # Check for 1c-Ent syntax (case-insensitive check)
+            # User specifically mentioned "1c-Ent syntax"
+            is_1c = '1c' in current_lang.lower() or 'ent' in current_lang.lower()
+            
+            if is_1c:
+                # Line comment with //
+                if hasattr(self, 'xml_editor') and self.xml_editor:
+                    self.xml_editor._toggle_line_comments(prefix="//")
+            else:
+                # Default to XML block comment <!-- -->
+                if hasattr(self, 'xml_editor') and self.xml_editor:
+                    self.xml_editor.toggle_block_comment()
+        except Exception as e:
+            print(f"Toggle comment error: {e}")
+
     
     def _apply_highlighter_settings(self):
         """Apply saved highlighter visibility settings after opening a file."""
         try:
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter'):
-                hide_syms = read_bool('hide_symbols', False)
-                hide_tgs = read_bool('hide_tags', False)
-                hide_vals = read_bool('hide_values', False)
+            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
+                hide_syms = self._read_flag('hide_symbols', False)
+                hide_tgs = self._read_flag('hide_tags', False)
+                hide_vals = self._read_flag('hide_values', False)
                 self.xml_editor.highlighter.set_visibility_options(
                     hide_symbols=hide_syms,
                     hide_tags=hide_tgs,
@@ -2503,20 +3980,83 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         
-        tree_label = QLabel("XML Structure")
-        tree_label.setStyleSheet("font-weight: bold; padding: 1px; font-size: 10px;")  # Reduced padding and font size
-        tree_label.setMaximumHeight(18)  # Add max height constraint
-        left_layout.addWidget(tree_label)
+        # Unified tree container with close button
+        self.tree_container = QWidget()
+        self.tree_container_layout = QVBoxLayout()
+        self.tree_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.tree_container_layout.setSpacing(0)
         
-        # Persistent container to show level header buttons above the tree
+        # Header row with title and close button
+        header_row = QWidget()
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(2)
+        
+        """ tree_label = QLabel("XML Structure")
+        tree_label.setStyleSheet("font-weight: bold; padding: 1px; font-size: 10px;")
+        header_layout.addWidget(tree_label)
+        header_layout.addStretch()
+        
+        # Close button - positioned at top right
+        close_btn = QPushButton("✕")
+        close_btn.setStyleSheet(" ""
+            QPushButton {
+                border: none;
+                background: transparent;
+                color: #888;
+                font-size: 12px;
+                padding: 0px;
+                margin: 0px;
+                width: 16px;
+                height: 16px;
+                border-radius: 2px;
+            }
+            QPushButton:hover {
+                background: #e0e0e0;
+                color: #333;
+            }
+        " "")
+        close_btn.setToolTip("Hide XML Structure panel")
+        close_btn.clicked.connect(self._hide_tree_panel)
+        header_layout.addWidget(close_btn) """
+        
+        header_row.setLayout(header_layout)
+        self.tree_container_layout.addWidget(header_row)
+        
+        # Search filter input
+        search_container = QWidget()
+        search_layout = QHBoxLayout()
+        search_layout.setContentsMargins(0, 2, 0, 2)
+        search_layout.setSpacing(4)
+        
+        search_label = QLabel("Filter:")
+        search_label.setStyleSheet("font-size: 9px;")
+        search_layout.addWidget(search_label)
+        
+        self.tree_search_input = QLineEdit()
+        self.tree_search_input.setPlaceholderText("Type to filter tree nodes...")
+        self.tree_search_input.setMaximumHeight(22)
+        self.tree_search_input.setStyleSheet("font-size: 9px; padding: 2px;")
+        self.tree_search_input.textChanged.connect(self._on_tree_search_changed)
+        self.tree_search_input.setClearButtonEnabled(True)
+        search_layout.addWidget(self.tree_search_input)
+        
+        search_container.setLayout(search_layout)
+        search_container.setMaximumHeight(26)
+        self.tree_container_layout.addWidget(search_container)
+        
+        # Persistent container for level header buttons
         self.level_header_container = QWidget()
-        self.level_header_container.setMaximumHeight(24)  # Reduced from implicit to 24
+        self.level_header_container.setMaximumHeight(24)
         _lvl_header_layout = QHBoxLayout()
         _lvl_header_layout.setContentsMargins(0, 0, 0, 0)
-        _lvl_header_layout.setSpacing(2)  # Add spacing control
+        _lvl_header_layout.setSpacing(2)
         self.level_header_container.setLayout(_lvl_header_layout)
-        left_layout.addWidget(self.level_header_container)
+        self.tree_container_layout.addWidget(self.level_header_container)
         
+        self.tree_container.setLayout(self.tree_container_layout)
+        
+        # Create xml_tree widget
         self.xml_tree = XmlTreeWidget()
         # Provide the container to the tree so it can mount header buttons
         self.xml_tree.header_container = self.level_header_container
@@ -2527,9 +4067,15 @@ class MainWindow(QMainWindow):
         try:
             self.xml_tree.itemCollapsed.connect(self._on_tree_item_collapsed)
             self.xml_tree.itemExpanded.connect(self._on_tree_item_expanded)
+            # Connect delete/hide signals
+            self.xml_tree.delete_node_requested.connect(self.delete_xml_node)
+            self.xml_tree.hide_node_requested.connect(self.hide_xml_node)
         except Exception:
             pass
-        left_layout.addWidget(self.xml_tree)
+        
+        # Add xml_tree BEFORE tree_container to left_layout
+        left_layout.addWidget(self.xml_tree, 1)  # stretch factor 1 - takes available space
+        left_layout.addWidget(self.tree_container, 0)  # stretch factor 0 - minimal space
         
         left_panel.setLayout(left_layout)
         
@@ -2547,6 +4093,11 @@ class MainWindow(QMainWindow):
         self.tab_widget.setTabsClosable(True)
         self.tab_widget.tabCloseRequested.connect(self._close_tab)
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
+        
+        # Tab context menu
+        self.tab_widget.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tab_widget.tabBar().customContextMenuRequested.connect(self._on_tab_context_menu)
+        
         self.update_tree_on_tab_switch = False  # Default: off to avoid tree updates on every keystroke
         # Reduce tab bar height
         self.tab_widget.setStyleSheet("""
@@ -2560,6 +4111,8 @@ class MainWindow(QMainWindow):
         
         # Create initial editor tab
         initial_editor = XmlEditorWidget()
+        initial_editor.fragment_editor_requested.connect(self.open_fragment_editor)
+        initial_editor.modification_changed.connect(self._on_editor_modification_changed)
         self.tab_widget.addTab(initial_editor, "Document 1")
         self.xml_editor = initial_editor  # Maintain existing reference for compatibility
         # Apply default/persisted language to the initial editor
@@ -2593,10 +4146,39 @@ class MainWindow(QMainWindow):
     def _create_status_bar(self):
         """Create status bar"""
         self.status_bar = self.statusBar()
-        # Set dark grey background for less contrast and reduce height by 1/3
-        self.status_bar.setStyleSheet("QStatusBar { background-color: #3C3C3C; color: #CCCCCC; max-height: 24px; padding: 0px; margin: 0px; }")
+        
+        # Random background color for status bar to distinguish multiple windows
+        # Pink, Blue, Green, Brown, Teal, Purple (dark muted shades)
+        colors = ["#5e3846", "#38495e", "#385e40", "#5e4838", "#385e5e", "#4b385e"]
+        bg_color = random.choice(colors)
+        
+        # Set background for less contrast and reduce height by 1/3
+        self.status_bar.setStyleSheet(f"QStatusBar {{ background-color: {bg_color}; color: #CCCCCC; max-height: 24px; padding: 0px; margin: 0px; }}")
         self.status_bar.setMaximumHeight(24)
         self.status_bar.setContentsMargins(0, 0, 0, 0)
+        
+        # Store button references for activity indication
+        self.status_buttons = {}
+
+        # Helper to create compact toolbuttons bound to actions
+        def _add_flag_button(layout, action, text=None, button_key=None):
+            btn = QToolButton()
+            btn.setAutoRaise(True)
+            btn.setStyleSheet("font-size: 9px; max-height: 22px; padding: 1px 3px; margin: 0px;")
+            btn.setMaximumHeight(22)
+            btn.setContentsMargins(0, 0, 0, 0)
+            if text:
+                # Override displayed text while keeping the action behavior
+                action.setText(text)
+            btn.setDefaultAction(action)
+            layout.addWidget(btn)
+            # Store button reference if key provided
+            if button_key:
+                self.status_buttons[button_key] = btn
+                # Connect toggle to style update
+                # Use lambda with default arg to capture key correctly
+                action.toggled.connect(lambda checked, k=button_key: self._update_button_state(k, checked))
+            return btn
         
         # Add status widgets with reduced font size (1/3 smaller)
         self.status_label = QLabel("Ready")
@@ -2604,6 +4186,28 @@ class MainWindow(QMainWindow):
         self.status_label.setContentsMargins(0, 0, 0, 0)
         self.status_bar.addWidget(self.status_label)
         
+        # New "Left Flags" container (placed before line counter)
+        try:
+            left_flags_bar = QWidget()
+            left_flags_bar.setMaximumHeight(22)
+            left_flags_bar.setContentsMargins(0, 0, 0, 0)
+            left_flags_layout = QHBoxLayout()
+            left_flags_layout.setContentsMargins(0, 0, 0, 0)
+            left_flags_layout.setSpacing(2)
+            left_flags_bar.setLayout(left_flags_layout)
+            
+            # Friendly Labels
+            if hasattr(self, 'toggle_friendly_labels_action'):
+                _add_flag_button(left_flags_layout, self.toggle_friendly_labels_action, text="Friendly", button_key='friendly')
+                
+            # Hide Leaves
+            if hasattr(self, 'toggle_hide_leaves_action'):
+                _add_flag_button(left_flags_layout, self.toggle_hide_leaves_action, text="HideLeaf", button_key='leaves')
+                
+            self.status_bar.addPermanentWidget(left_flags_bar)
+        except Exception as e:
+            print(f"Left flags bar init error: {e}")
+
         sep1 = QLabel("|")
         sep1.setStyleSheet("font-size: 9px; padding: 0px; margin: 0px;")
         sep1.setContentsMargins(0, 0, 0, 0)
@@ -2667,39 +4271,19 @@ class MainWindow(QMainWindow):
             flags_layout.setSpacing(2)
             flags_bar.setLayout(flags_layout)
 
-            # Store button references for activity indication
-            self.status_buttons = {}
-
-            # Create compact toolbuttons bound to existing actions
-            def _add_flag_button(action, text=None, button_key=None):
-                btn = QToolButton()
-                btn.setAutoRaise(True)
-                btn.setStyleSheet("font-size: 9px; max-height: 22px; padding: 1px 3px; margin: 0px;")
-                btn.setMaximumHeight(22)
-                btn.setContentsMargins(0, 0, 0, 0)
-                if text:
-                    # Override displayed text while keeping the action behavior
-                    action.setText(text)
-                btn.setDefaultAction(action)
-                flags_layout.addWidget(btn)
-                # Store button reference if key provided
-                if button_key:
-                    self.status_buttons[button_key] = btn
-                return btn
-
             # Sync, Symbols, Tags, Values, Highlight, Update Tree
             if hasattr(self, 'toggle_highlight_action'):
-                _add_flag_button(self.toggle_highlight_action, text="NodeHilit", button_key='highlight')
+                _add_flag_button(flags_layout, self.toggle_highlight_action, text="NodeHilit", button_key='highlight')
             if hasattr(self, 'toggle_sync_action'):
-                _add_flag_button(self.toggle_sync_action, text="Sync", button_key='sync')
+                _add_flag_button(flags_layout, self.toggle_sync_action, text="Sync", button_key='sync')
             if hasattr(self, 'toggle_symbols_action'):
-                _add_flag_button(self.toggle_symbols_action, text="<>", button_key='symbols')
+                _add_flag_button(flags_layout, self.toggle_symbols_action, text="<>", button_key='symbols')
             if hasattr(self, 'toggle_tags_action'):
-                _add_flag_button(self.toggle_tags_action, text="Tags", button_key='tags')
+                _add_flag_button(flags_layout, self.toggle_tags_action, text="Tags", button_key='tags')
             if hasattr(self, 'toggle_values_action'):
-                _add_flag_button(self.toggle_values_action, text="Vals", button_key='values')
+                _add_flag_button(flags_layout, self.toggle_values_action, text="Vals", button_key='values')
             if hasattr(self, 'update_tree_toggle'):
-                _add_flag_button(self.update_tree_toggle, text="UpdTree", button_key='updtree')
+                _add_flag_button(flags_layout, self.update_tree_toggle, text="UpdTree", button_key='updtree')
 
             self.status_bar.addPermanentWidget(flags_bar)
         except Exception as e:
@@ -2708,9 +4292,13 @@ class MainWindow(QMainWindow):
         # Removed duplicate rightmost text indicator to avoid redundancy
 
     def _update_flags_indicator(self):
-        """Update compact flags indicator in the status bar."""
         try:
+            #"""Update compact flags string in status bar"""
             parts = []
+            # Spartan Mode
+            if hasattr(self, 'spartan_mode_action') and self.spartan_mode_action.isChecked():
+                parts.append("SPARTAN")
+
             # Sync
             if hasattr(self, 'toggle_sync_action'):
                 parts.append(f"Sync:{'on' if self.toggle_sync_action.isChecked() else 'off'}")
@@ -2737,10 +4325,6 @@ class MainWindow(QMainWindow):
                 self.flags_label.setText(" ".join(parts))
         except Exception as e:
             print(f"Flags indicator update error: {e}")
-        
-        # Set status_label reference on xml_tree after it's created
-        if hasattr(self, 'xml_tree'):
-            self.xml_tree.status_label = self.status_label
 
     def _update_button_state(self, button_key: str, is_active: bool):
         """Update button appearance to reflect its ON/OFF state."""
@@ -2763,6 +4347,17 @@ class MainWindow(QMainWindow):
         if getattr(self, 'debug_mode', False):
             print(message)
     
+    def apply_line_numbers_to_all_editors(self, visible: bool):
+        """Apply line number visibility to all editor tabs"""
+        try:
+            if hasattr(self, 'tab_widget'):
+                for i in range(self.tab_widget.count()):
+                    editor = self.tab_widget.widget(i)
+                    if isinstance(editor, XmlEditorWidget):
+                        editor.set_line_numbers_visible(visible)
+        except Exception as e:
+            print(f"Error applying line numbers: {e}")
+    
     def _save_flag(self, key: str, value: bool):
         try:
             s = self._get_settings()
@@ -2770,28 +4365,54 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error saving flag '{key}': {e}")
 
+    def _read_flag(self, name: str, default: bool) -> bool:
+        """Helper to read boolean flag from settings"""
+        try:
+            s = self._get_settings()
+            v = s.value(f"flags/{name}")
+            if v is None:
+                return default
+            # QSettings may store as string "true"/"false" or QVariant
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.lower() in ("1", "true", "yes", "on")
+            return bool(v)
+        except Exception:
+            return default
+
     def _load_persisted_flags(self):
         """Load persisted flags and apply them to actions and UI state."""
-        s = self._get_settings()
-        # Helper to read boolean with default
-        def read_bool(name: str, default: bool) -> bool:
-            try:
-                v = s.value(f"flags/{name}")
-                if v is None:
-                    return default
-                # QSettings may store as string "true"/"false" or QVariant
-                if isinstance(v, bool):
-                    return v
-                if isinstance(v, str):
-                    return v.lower() in ("1", "true", "yes", "on")
-                return bool(v)
-            except Exception:
-                return default
-
         # Apply to actions without emitting toggled signals
+        # Spartan Mode
+        if hasattr(self, 'spartan_mode_action'):
+            val = self._read_flag('spartan_mode', False)
+            try:
+                self.spartan_mode_action.blockSignals(True)
+                self.spartan_mode_action.setChecked(val)
+                self.spartan_mode_action.blockSignals(False)
+            except Exception:
+                pass
+            self.spartan_mode = val
+            # If enabled, enforce disabled states on other flags
+            if val:
+                # We need to ensure these are OFF regardless of what was just loaded
+                # However, _load_persisted_flags logic is sequential.
+                # If we load spartan mode late, we can override previous loaded values.
+                # Or we can just rely on the toggle handler if we trigger it, but we blocked signals.
+                # So we must manually apply effects here.
+                if hasattr(self, 'toggle_sync_action'):
+                    self.toggle_sync_action.setChecked(False)
+                if hasattr(self, 'toggle_update_tree_view_action'):
+                    self.toggle_update_tree_view_action.setChecked(False)
+                if hasattr(self, 'toggle_highlight_action'):
+                    self.toggle_highlight_action.setChecked(False)
+
         # Sync
         if hasattr(self, 'toggle_sync_action'):
-            val = read_bool('sync_enabled', False)
+            val = self._read_flag('sync_enabled', False)
+            if getattr(self, 'spartan_mode', False):
+                val = False
             try:
                 self.toggle_sync_action.blockSignals(True)
                 self.toggle_sync_action.setChecked(val)
@@ -2803,46 +4424,60 @@ class MainWindow(QMainWindow):
             self._update_button_state('sync', val)
         # Symbols
         if hasattr(self, 'toggle_symbols_action'):
-            val = read_bool('hide_symbols', False)
+            val = self._read_flag('hide_symbols', False)
             try:
                 self.toggle_symbols_action.blockSignals(True)
                 self.toggle_symbols_action.setChecked(val)
                 self.toggle_symbols_action.blockSignals(False)
             except Exception:
                 pass
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter'):
+            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
                 self.xml_editor.highlighter.set_visibility_options(hide_symbols=val)
             # Update button state
             self._update_button_state('symbols', val)
         # Tags
         if hasattr(self, 'toggle_tags_action'):
-            val = read_bool('hide_tags', False)
+            val = self._read_flag('hide_tags', False)
             try:
                 self.toggle_tags_action.blockSignals(True)
                 self.toggle_tags_action.setChecked(val)
                 self.toggle_tags_action.blockSignals(False)
             except Exception:
                 pass
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter'):
+            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
                 self.xml_editor.highlighter.set_visibility_options(hide_tags=val)
             # Update button state
             self._update_button_state('tags', val)
         # Values
         if hasattr(self, 'toggle_values_action'):
-            val = read_bool('hide_values', False)
+            val = self._read_flag('hide_values', False)
             try:
                 self.toggle_values_action.blockSignals(True)
                 self.toggle_values_action.setChecked(val)
                 self.toggle_values_action.blockSignals(False)
             except Exception:
                 pass
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter'):
+            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
                 self.xml_editor.highlighter.set_visibility_options(hide_values=val)
             # Update button state
             self._update_button_state('values', val)
+        # Highlight (Node Hilit)
+        if hasattr(self, 'toggle_highlight_action'):
+            val = self._read_flag('highlight_enabled', True)
+            if getattr(self, 'spartan_mode', False):
+                val = False
+            try:
+                self.toggle_highlight_action.blockSignals(True)
+                self.toggle_highlight_action.setChecked(val)
+                self.toggle_highlight_action.blockSignals(False)
+            except Exception:
+                pass
+            self.highlight_enabled = val
+            # Update button state
+            self._update_button_state('highlight', val)
         # Friendly labels
         if hasattr(self, 'toggle_friendly_labels_action'):
-            val = read_bool('friendly_labels', True)
+            val = self._read_flag('friendly_labels', True)
             try:
                 self.toggle_friendly_labels_action.blockSignals(True)
                 self.toggle_friendly_labels_action.setChecked(val)
@@ -2852,8 +4487,36 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'xml_tree') and self.xml_tree:
                 self.xml_tree.use_friendly_labels = val
                 self.xml_tree.refresh_labels()
+        # Show tree header preference
+        show_tree_header = self._read_flag('show_tree_header', True)  # Default: show
+        if not show_tree_header:
+            # Hide unified tree container if it exists
+            if hasattr(self, 'tree_container') and self.tree_container:
+                self.tree_container.hide()
+            # Hide left panel if it exists
+            if hasattr(self, 'left_panel') and self.left_panel:
+                self.left_panel.hide()
+        
         # Update tree on tab switch (both actions reflect)
-        val_upd = read_bool('update_tree_on_tab_switch', False)  # Default: off
+        val_upd = self._read_flag('update_tree_on_tab_switch', False)  # Default: off
+        
+        # Line numbers
+        show_line_numbers = self._read_flag('show_line_numbers', False)  # Default: off
+        self.apply_line_numbers_to_all_editors(show_line_numbers)
+        # Sync toggle action state
+        if hasattr(self, 'toggle_line_numbers_action'):
+            try:
+                self.toggle_line_numbers_action.blockSignals(True)
+                self.toggle_line_numbers_action.setChecked(show_line_numbers)
+                self.toggle_line_numbers_action.blockSignals(False)
+            except Exception:
+                pass
+        
+        # Auto rebuild tree
+        self.auto_rebuild_tree = self._read_flag('auto_rebuild_tree', True)  # Default: on
+        
+        if getattr(self, 'spartan_mode', False):
+            val_upd = False
         if hasattr(self, 'update_tree_toggle'):
             try:
                 self.update_tree_toggle.blockSignals(True)
@@ -2888,8 +4551,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         # Hide leaves
+        if hasattr(self, 'auto_hide_enabled'):
+            self.auto_hide_enabled = self._read_flag('auto_hide', True)
         if hasattr(self, 'toggle_hide_leaves_action'):
-            val = read_bool('hide_leaves', True)
+            val = self._read_flag('hide_leaves', True)
             try:
                 self.toggle_hide_leaves_action.blockSignals(True)
                 self.toggle_hide_leaves_action.setChecked(val)
@@ -2900,7 +4565,7 @@ class MainWindow(QMainWindow):
                 self.xml_tree.set_hide_leaves(val)
         # Breadcrumbs
         if hasattr(self, 'toggle_breadcrumb_action'):
-            val = read_bool('show_breadcrumbs', False)
+            val = self._read_flag('show_breadcrumbs', False)
             try:
                 self.toggle_breadcrumb_action.blockSignals(True)
                 self.toggle_breadcrumb_action.setChecked(val)
@@ -2913,7 +4578,7 @@ class MainWindow(QMainWindow):
                 pass
         # Bottom panel
         if hasattr(self, 'toggle_bottom_panel_action'):
-            val = read_bool('show_bottom_panel', False)
+            val = self._read_flag('show_bottom_panel', False)
             try:
                 self.toggle_bottom_panel_action.blockSignals(True)
                 self.toggle_bottom_panel_action.setChecked(val)
@@ -2926,7 +4591,7 @@ class MainWindow(QMainWindow):
                 pass
         # File navigator
         if hasattr(self, 'toggle_file_navigator_action'):
-            val = read_bool('show_file_navigator', True)
+            val = self._read_flag('show_file_navigator', True)
             try:
                 self.toggle_file_navigator_action.blockSignals(True)
                 self.toggle_file_navigator_action.setChecked(val)
@@ -2948,7 +4613,7 @@ class MainWindow(QMainWindow):
 
         # Exchange mode (semi-auto toggle)
         if hasattr(self, 'exchange_mode_action'):
-            val = read_bool('exchange_semi_mode', True)
+            val = self._read_flag('exchange_semi_mode', True)
             try:
                 self.exchange_mode_action.blockSignals(True)
                 self.exchange_mode_action.setChecked(val)
@@ -2965,14 +4630,14 @@ class MainWindow(QMainWindow):
             self.tree_update_debounce_interval = 5000
         
         # Load debug mode from settings
-        debug_mode_val = read_bool('debug_mode', False)
+        debug_mode_val = self._read_flag('debug_mode', False)
         self.debug_mode = debug_mode_val
         
         # Auto-hide preferences
-        toolbar_autohide_val = read_bool('toolbar_autohide', True)
-        tree_header_autohide_val = read_bool('tree_header_autohide', True)
-        tree_column_header_autohide_val = read_bool('tree_column_header_autohide', True)
-        tab_bar_autohide_val = read_bool('tab_bar_autohide', True)
+        toolbar_autohide_val = self._read_flag('toolbar_autohide', True)
+        tree_header_autohide_val = self._read_flag('tree_header_autohide', True)
+        tree_column_header_autohide_val = self._read_flag('tree_column_header_autohide', True)
+        tab_bar_autohide_val = self._read_flag('tab_bar_autohide', True)
         
         if hasattr(self, 'toggle_toolbar_autohide_action'):
             try:
@@ -3042,7 +4707,7 @@ class MainWindow(QMainWindow):
 
         # Apply persisted theme AFTER visibility options so they are preserved
         try:
-            is_dark = read_bool('dark_theme', True)
+            is_dark = self._read_flag('dark_theme', True)
             if is_dark:
                 self.set_dark_theme()
             else:
@@ -3052,17 +4717,17 @@ class MainWindow(QMainWindow):
 
         # Reapply visibility options after theme to ensure they take effect
         try:
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter'):
-                hide_syms = read_bool('hide_symbols', False)
-                hide_tgs = read_bool('hide_tags', False)
-                hide_vals = read_bool('hide_values', False)
-                print(f"DEBUG: Reapplying visibility - symbols:{hide_syms}, tags:{hide_tgs}, values:{hide_vals}")
+            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
+                hide_syms = self._read_flag('hide_symbols', False)
+                hide_tgs = self._read_flag('hide_tags', False)
+                hide_vals = self._read_flag('hide_values', False)
+                self._debug_print(f"DEBUG: Reapplying visibility - symbols:{hide_syms}, tags:{hide_tgs}, values:{hide_vals}")
                 self.xml_editor.highlighter.set_visibility_options(
                     hide_symbols=hide_syms,
                     hide_tags=hide_tgs,
                     hide_values=hide_vals
                 )
-                print(f"DEBUG: Highlighter state after reapply - symbols:{self.xml_editor.highlighter.hide_symbols}, tags:{self.xml_editor.highlighter.hide_tags}, values:{self.xml_editor.highlighter.hide_values}")
+                self._debug_print(f"DEBUG: Highlighter state after reapply - symbols:{self.xml_editor.highlighter.hide_symbols}, tags:{self.xml_editor.highlighter.hide_tags}, values:{self.xml_editor.highlighter.hide_values}")
         except Exception as e:
             print(f"Error reapplying visibility options: {e}")
 
@@ -3260,15 +4925,26 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+
+
     def _on_find_result_double_clicked(self, item):
         """Navigate to the match when a find result is double-clicked"""
         try:
+            # Get the row index of the double-clicked item
             row = self.bottom_panel.find_results.row(item)
+            print(f"DEBUG: Double-clicked item at row {row}, total results: {len(self.last_search_results)}")
+            
             if 0 <= row < len(self.last_search_results):
+                # Update current search index to match the clicked item
                 self.current_search_index = row
+                # Navigate to the specific result
                 self._navigate_to_search_result(row)
+            else:
+                print(f"DEBUG: Row {row} is out of bounds for search results")
         except Exception as e:
             print(f"Find result double-click error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _on_bookmark_item_double_clicked(self, item):
         """Navigate to the line when a bookmark item is double-clicked"""
@@ -3289,6 +4965,30 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Bookmark item double-click error: {e}")
 
+    def _on_editor_modification_changed(self, modified: bool):
+        """Update tab title with unsaved indicator (*)"""
+        try:
+            editor = self.sender()
+            if not isinstance(editor, XmlEditorWidget):
+                return
+            
+            index = self.tab_widget.indexOf(editor)
+            if index == -1:
+                return
+            
+            title = self.tab_widget.tabText(index)
+            has_star = title.startswith("*")
+            clean_title = title[1:] if has_star else title
+            
+            if modified:
+                if not has_star:
+                    self.tab_widget.setTabText(index, f"*{clean_title}")
+            else:
+                if has_star:
+                    self.tab_widget.setTabText(index, clean_title)
+        except Exception as e:
+            print(f"Error updating tab title: {e}")
+
     def _on_tab_changed(self, index: int):
         """Handle tab change: swap current editor reference and optionally update tree"""
         try:
@@ -3306,6 +5006,9 @@ class MainWindow(QMainWindow):
                 pass
             # Update reference and connect signals
             self.xml_editor = new_widget
+            self.current_file = getattr(self.xml_editor, 'file_path', None)
+            self._update_window_title()
+            
             self.xml_editor.content_changed.connect(self.on_content_changed)
             self.xml_editor.cursor_position_changed.connect(self.on_cursor_changed)
             # Apply selected language to the new active editor
@@ -3320,6 +5023,31 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error on tab change: {e}")
 
+    def _on_tab_context_menu(self, point):
+        """Show context menu for tab bar."""
+        try:
+            tab_bar = self.tab_widget.tabBar()
+            index = tab_bar.tabAt(point)
+            
+            menu = QMenu(self)
+            
+            # Action: Replace link with edited text
+            replace_action = menu.addAction("Replace link with edited text from separate tab")
+            replace_action.setShortcut("Shift+F5")
+            replace_action.triggered.connect(self.replace_link_with_tab_content)
+            
+            menu.addSeparator()
+            
+            # Action: Close
+            close_action = menu.addAction("Close Tab")
+            close_action.triggered.connect(lambda: self._close_tab(index) if index >= 0 else None)
+            if index < 0:
+                close_action.setEnabled(False)
+            
+            menu.exec(tab_bar.mapToGlobal(point))
+        except Exception as e:
+            print(f"Tab context menu error: {e}")
+
     def _close_tab(self, index: int):
         """Close tab and clean up references"""
         widget = self.tab_widget.widget(index)
@@ -3327,6 +5055,13 @@ class MainWindow(QMainWindow):
         # If closing active tab, _on_tab_changed will update reference; ensure we have at least one tab
         if self.tab_widget.count() == 0:
             new_editor = XmlEditorWidget()
+            new_editor.fragment_editor_requested.connect(self.open_fragment_editor)
+            new_editor.modification_changed.connect(self._on_editor_modification_changed)
+            
+            # Apply line numbers setting
+            show_line_numbers = self._read_flag('show_line_numbers', False)
+            new_editor.set_line_numbers_visible(show_line_numbers)
+            
             self.tab_widget.addTab(new_editor, "Document")
             self.xml_editor = new_editor
             self._connect_signals()
@@ -3334,7 +5069,14 @@ class MainWindow(QMainWindow):
     def _create_editor_tab(self, title: str, content: str):
         """Create a new editor tab with given title and content, return editor and index"""
         editor = XmlEditorWidget()
+        editor.fragment_editor_requested.connect(self.open_fragment_editor)
+        editor.modification_changed.connect(self._on_editor_modification_changed)
         editor.set_content(content)
+        
+        # Apply line numbers setting
+        show_line_numbers = self._read_flag('show_line_numbers', False)
+        editor.set_line_numbers_visible(show_line_numbers)
+        
         index = self.tab_widget.addTab(editor, title)
         # Switch to the new tab
         self.tab_widget.setCurrentIndex(index)
@@ -3396,6 +5138,142 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"Unfold current element error: {e}")
 
+    def unfold_all_elements(self):
+        """Unfold all folded elements in the editor."""
+        try:
+            self.xml_editor.unfold_all()
+            if hasattr(self, 'status_label') and self.status_label:
+                self.status_label.setText("All elements unfolded")
+        except Exception as e:
+            print(f"Unfold all error: {e}")
+
+    def jump_to_matching_tag(self, direction: str):
+        """
+        Jump to matching tag based on direction.
+        direction: 'next_close' (Ctrl+]) or 'prev_open' (Ctrl+[)
+        """
+        try:
+            editor = self.xml_editor
+            text = editor.get_content()
+            cursor = editor.textCursor()
+            pos = cursor.position()
+            
+            # Get all enclosing ranges
+            ranges = self._compute_enclosing_xml_ranges(text)
+            
+            # Filter for ranges containing the cursor
+            containing = [r for r in ranges if r[1] <= pos <= r[2]]
+            if not containing:
+                return
+
+            # Sort by size (smallest first -> innermost)
+            containing.sort(key=lambda r: (r[2] - r[1]))
+            
+            target_pos = None
+            
+            if direction == 'next_close':
+                # Find innermost range where end > pos
+                for r in containing:
+                    if r[2] > pos:
+                        target_pos = r[2]
+                        break
+            elif direction == 'prev_open':
+                # Find innermost range where start < pos
+                for r in containing:
+                    if r[1] < pos:
+                        target_pos = r[1]
+                        break
+            
+            if target_pos is not None:
+                new_cursor = QTextCursor(editor.document())
+                new_cursor.setPosition(target_pos)
+                editor.setTextCursor(new_cursor)
+                if hasattr(self, 'status_label') and self.status_label:
+                    self.status_label.setText(f"Jumped to position {target_pos}")
+                
+        except Exception as e:
+            print(f"Jump error: {e}")
+
+    def fold_by_level(self, level: int):
+        """Fold all XML elements at the specified nesting level."""
+        try:
+            content = self.xml_editor.get_content()
+            if not content:
+                return
+
+            # Regex patterns (same as _compute_enclosing_xml_ranges)
+            comment_pattern = re.compile(r"<!--.*?-->", re.DOTALL)
+            cdata_pattern = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
+            pi_pattern = re.compile(r"<\?.*?\?>", re.DOTALL)
+            doctype_pattern = re.compile(r"<!DOCTYPE.*?>", re.DOTALL)
+            
+            special_spans = []
+            for pat in (comment_pattern, cdata_pattern, pi_pattern, doctype_pattern):
+                for m in pat.finditer(content):
+                    special_spans.append((m.start(), m.end()))
+            
+            tag_pattern = re.compile(r"<(/?)([^\s>/]+)([^>]*)>", re.UNICODE)
+            
+            stack = []  # (tag, start_index, depth)
+            ranges_to_fold = []
+            
+            # Helper to check if pos is in special span
+            def is_special(pos):
+                for s, e in special_spans:
+                    if s <= pos < e:
+                        return True
+                return False
+
+            for m in tag_pattern.finditer(content):
+                if is_special(m.start()):
+                    continue
+                    
+                is_close = m.group(1) == '/'
+                tag = m.group(2)
+                rest = m.group(3) or ''
+                self_closing = rest.rstrip().endswith('/')
+                
+                if not is_close and not self_closing:
+                    # Open tag
+                    depth = len(stack) + 1
+                    stack.append((tag, m.start(), depth))
+                elif is_close:
+                    # Close tag
+                    # Try to match with stack
+                    for si in range(len(stack) - 1, -1, -1):
+                        if stack[si][0] == tag:
+                            # Found match
+                            opentag, start_idx, depth = stack.pop(si)
+                            # If this element is at the target level, mark for folding
+                            if depth == level:
+                                end_idx = m.end()
+                                ranges_to_fold.append((start_idx, end_idx))
+                            break
+            
+            if not ranges_to_fold:
+                self.status_label.setText(f"No elements found at level {level}")
+                return
+
+            doc = self.xml_editor.document()
+            count = 0
+            lines_ranges = []
+            
+            for start_idx, end_idx in ranges_to_fold:
+                # Map char position to block number (0-based) -> line number (1-based)
+                start_line = doc.findBlock(start_idx).blockNumber() + 1
+                end_line = doc.findBlock(end_idx).blockNumber() + 1
+                
+                if start_line < end_line:
+                    lines_ranges.append((start_line, end_line))
+                    count += 1
+            
+            if lines_ranges:
+                self.xml_editor.fold_multiple_lines(lines_ranges)
+                self.status_label.setText(f"Folded {count} elements at level {level}")
+            
+        except Exception as e:
+            print(f"Fold by level error: {e}")
+
     def _find_range_for_tree_item(self, item):
         """Compute (start_line, end_line) for a given tree item by using its opening tag line and range scan."""
         try:
@@ -3449,6 +5327,27 @@ class MainWindow(QMainWindow):
                 self.xml_editor.unfold_lines(rng[0], rng[1])
         except Exception as e:
             print(f"Tree expand sync error: {e}")
+    
+    def _on_tree_search_changed(self, text: str):
+        """Handle tree search filter text change"""
+        try:
+            if hasattr(self, 'xml_tree') and self.xml_tree:
+                self.xml_tree.set_search_filter(text)
+        except Exception as e:
+            print(f"Tree search error: {e}")
+
+    def _hide_tree_panel(self):
+        """Hide the XML Structure panel and save the preference"""
+        try:
+            # Hide the unified tree container
+            if hasattr(self, 'tree_container') and self.tree_container:
+                self.tree_container.hide()
+            # Also hide the left panel if it exists
+            if hasattr(self, 'left_panel') and self.left_panel:
+                self.left_panel.hide()
+            self._save_flag('show_tree_header', False)
+        except Exception as e:
+            print(f"Error hiding tree panel: {e}")
 
     # --- F4/F5 helpers ---
     def _compute_enclosing_xml_ranges(self, text: str):
@@ -3502,8 +5401,117 @@ class MainWindow(QMainWindow):
         ranges.sort(key=lambda r: (r[2] - r[1]))
         return ranges
 
-    def select_xml_node_or_parent(self):
-        """Select XML node at cursor; repeated presses select parent element."""
+    def _get_node_range(self, node):
+        """Get (start, end) text positions for an XmlTreeNode"""
+        if not node or node.line_number <= 0:
+            return None
+            
+        editor = self.xml_editor
+        text = editor.get_content()
+        ranges = self._compute_enclosing_xml_ranges(text)
+        
+        # Find range that starts at the node's line
+        doc = editor.document()
+        # node.line_number is 1-based
+        try:
+            target_block_num = node.line_number - 1
+            if target_block_num < 0 or target_block_num >= doc.blockCount():
+                return None
+        except Exception:
+            return None
+            
+        candidates = []
+        for r in ranges:
+            tag, start, end = r
+            r_block = doc.findBlock(start)
+            if r_block.blockNumber() == target_block_num:
+                candidates.append(r)
+        
+        if not candidates:
+            return None
+            
+        # Match tag if possible
+        for r in candidates:
+            if r[0] == node.tag:
+                return (r[1], r[2])
+        
+        return (candidates[0][1], candidates[0][2])
+
+    def delete_xml_node(self, node):
+        """Delete the XML block corresponding to the node"""
+        try:
+            r = self._get_node_range(node)
+            if not r:
+                QMessageBox.warning(self, "Delete Error", "Could not locate the XML block in the editor.\nTry rebuilding the tree first.")
+                return
+                
+            start, end = r
+            cursor = self.xml_editor.textCursor()
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+            
+            # Rebuild tree
+            self.rebuild_tree_with_autoclose()
+            if hasattr(self, 'status_label'):
+                self.status_label.setText(f"Deleted {node.tag}")
+        except Exception as e:
+            QMessageBox.warning(self, "Delete Error", f"An error occurred: {e}")
+
+    def hide_xml_node(self, node):
+        """Hide (comment out) the XML block corresponding to the node"""
+        try:
+            r = self._get_node_range(node)
+            if not r:
+                QMessageBox.warning(self, "Hide Error", "Could not locate the XML block in the editor.\nTry rebuilding the tree first.")
+                return
+                
+            start, end = r
+            editor = self.xml_editor
+            text = editor.get_content()
+            selected_text = text[start:end]
+            
+            if "-->" in selected_text:
+                 QMessageBox.warning(self, "Hide Error", "Cannot comment out block containing '-->'.")
+                 return
+    
+            cursor = editor.textCursor()
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            cursor.insertText(f"<!-- {selected_text} -->")
+            
+            # Rebuild tree
+            self.rebuild_tree_with_autoclose()
+            if hasattr(self, 'status_label'):
+                self.status_label.setText(f"Hidden {node.tag}")
+        except Exception as e:
+            QMessageBox.warning(self, "Hide Error", f"An error occurred: {e}")
+
+    def _get_inner_xml_range(self, text, start, end):
+        """Helper to get inner content range excluding border tags."""
+        # Find end of opening tag
+        open_tag_end_idx = text.find('>', start, end)
+        if open_tag_end_idx != -1:
+             content_start = open_tag_end_idx + 1
+        else:
+             content_start = start
+
+        # Find start of closing tag
+        close_tag_start_idx = text.rfind('<', start, end)
+        if close_tag_start_idx != -1:
+             content_end = close_tag_start_idx
+        else:
+             content_end = end
+             
+        # Handle self-closing
+        if content_start >= content_end:
+             return content_end, content_end
+        return content_start, content_end
+
+    def select_xml_node_or_parent(self, exclude_border_tags=False):
+        """Select XML node at cursor; repeated presses select parent element.
+           If exclude_border_tags is True, selects only the content inside tags.
+        """
         editor = self.xml_editor
         text = editor.get_content()
         cursor = editor.textCursor()
@@ -3520,6 +5528,10 @@ class MainWindow(QMainWindow):
                     return min(abs(p - r[1]), abs(p - r[2]))
                 nearest = min(ranges, key=lambda r: _distance_to_range(pos, r))
                 start, end = nearest[1], nearest[2]
+                
+                if exclude_border_tags:
+                    start, end = self._get_inner_xml_range(text, start, end)
+
                 new_cursor = editor.textCursor()
                 new_cursor.setPosition(start)
                 new_cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
@@ -3535,6 +5547,8 @@ class MainWindow(QMainWindow):
             cursor.select(QTextCursor.SelectionType.LineUnderCursor)
             editor.setTextCursor(cursor)
             return
+        
+        target = None
         if not cursor.hasSelection():
             # First press: select deepest element
             target = containing_sorted[0]
@@ -3543,14 +5557,35 @@ class MainWindow(QMainWindow):
             sel_end = max(cursor.anchor(), cursor.position())
             # Find current selection in the chain
             idx = next((i for i, r in enumerate(containing_sorted) if r[1] == sel_start and r[2] == sel_end), None)
-            if idx is None:
-                # If current selection isn't one of the known ranges, select deepest first
-                target = containing_sorted[0]
-            else:
-                # Next press: move to immediate parent if available, else keep current
+            
+            if idx is not None:
+                # Found exact full match. Move to parent.
                 parent_idx = min(idx + 1, len(containing_sorted) - 1)
                 target = containing_sorted[parent_idx]
+            else:
+                # No full match. 
+                # If exclude_border_tags is True, check if we match the CONTENT of any range.
+                matched_content_idx = None
+                if exclude_border_tags:
+                    for i, r in enumerate(containing_sorted):
+                        c_start, c_end = self._get_inner_xml_range(text, r[1], r[2])
+                        if c_start == sel_start and c_end == sel_end:
+                            matched_content_idx = i
+                            break
+                
+                if matched_content_idx is not None:
+                     # Found content match. Move to parent.
+                     parent_idx = min(matched_content_idx + 1, len(containing_sorted) - 1)
+                     target = containing_sorted[parent_idx]
+                else:
+                    # If current selection isn't one of the known ranges, select deepest first
+                    target = containing_sorted[0]
+
         start, end = target[1], target[2]
+        
+        if exclude_border_tags:
+            start, end = self._get_inner_xml_range(text, start, end)
+
         new_cursor = editor.textCursor()
         new_cursor.setPosition(start)
         new_cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
@@ -3644,12 +5679,24 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'status_label') and self.status_label:
             self.status_label.setText(f"Replaced link {link_id} with tab content")
     
+    def file_new_window(self):
+        """Open a new editor window"""
+        # Launch a new instance of the application
+        if getattr(sys, 'frozen', False):
+            # If running as compiled executable
+            subprocess.Popen([sys.executable])
+        else:
+            # If running as script
+            subprocess.Popen([sys.executable, sys.argv[0]])
+
     def new_file(self):
         """Create new file"""
         self.current_file = None
+        self.current_zip_source = None
         self.xml_editor.set_content("")
         self.xml_tree.clear()
-        self.setWindowTitle("Lotus Xml Editor - New File")
+        self.current_file = None
+        self._update_window_title()
         self.status_label.setText("New file created")
         
         # Clear recent files list when creating a new file
@@ -3659,15 +5706,24 @@ class MainWindow(QMainWindow):
     
     def open_file(self, file_path=None):
         """Open XML file"""
+        print(f"DEBUG: open_file called with {file_path}")
         if file_path is None:
             file_path, _ = QFileDialog.getOpenFileName(
-                self, "Open XML File", "", "XML Files (*.xml);;All Files (*.*)"
+                self, "Open XML or Zip File", "", "XML Files (*.xml);;Zip Archives (*.zip);;All Files (*.*)"
             )
         
         if file_path:
+            print(f"DEBUG: Opening file: {file_path}")
+            # Check for Zip file
+            if file_path.lower().endswith('.zip'):
+                self._open_zip_workflow(file_path)
+                return
+
+            splash = None
             try:
                 # Check file size first
                 file_size = os.path.getsize(file_path)
+                print(f"DEBUG: File size: {file_size}")
                 
                 # For large files (>1MB), show progress and use chunked reading
                 if file_size > 1024 * 1024:
@@ -3678,65 +5734,321 @@ class MainWindow(QMainWindow):
                     QApplication.processEvents()  # Update UI
                     
                     # Read large files in chunks to avoid memory issues
-                    content = self._read_large_file(file_path)
+                    content = self._read_file_robust(file_path)
                     
-                    splash.close()
+                    # Update splash for tree building phase
+                    splash.show_message(f"Building tree structure...")
+                    QApplication.processEvents()
                 else:
-                    # Read small files normally
-                    with open(file_path, 'r', encoding='utf-8') as file:
-                        content = file.read()
+                    # Read small files using robust reader too (to handle encodings)
+                    content = self._read_file_robust(file_path)
                 
+                print(f"DEBUG: Content read, length: {len(content)}")
+                
+                # Set content first (this is fast)
                 self.xml_editor.set_content(content)
-                self.xml_tree.populate_tree(content)
+                print("DEBUG: Content set to editor")
+
+                
+                # For large files (>1MB), defer tree building
+                file_size_mb = file_size / (1024 * 1024)
+                if file_size_mb > 1.0:
+                    # Close splash before deferring
+                    if splash:
+                        splash.close()
+                        splash = None
+                    
+                    self.status_label.setText(f"File loaded. Building tree in background...")
+                    QApplication.processEvents()
+                    
+                    # Defer tree building to allow UI to be responsive
+                    # Optimization: Call populate_tree directly with file_path to use lxml fast path
+                    if self.toggle_update_tree_view_action.isChecked():
+                        QTimer.singleShot(100, lambda: self.xml_tree.populate_tree(content, show_progress=True, file_path=file_path))
+                    else:
+                        self.status_label.setText(f"File loaded. Tree building skipped (Spartan Mode).")
+                else:
+                    # Build tree immediately for smaller files
+                    if self.toggle_update_tree_view_action.isChecked():
+                        self.xml_tree.populate_tree(content, show_progress=True, file_path=file_path)
+                    else:
+                        self.xml_tree.clear()
+                        self.status_label.setText(f"File loaded. Tree building skipped (Spartan Mode).")
+                    
+                    # Close splash after tree is built
+                    if splash:
+                        splash.close()
+                        splash = None
+                    
+                    self._finalize_open_file(file_path)
                 
                 # Apply saved highlighter visibility settings
                 self._apply_highlighter_settings()
                 
-                self.current_file = file_path
-                self.setWindowTitle(f"Lotus Xml Editor - {os.path.basename(file_path)}")
-                self.status_label.setText(f"Opened: {file_path}")
-                
-                # Update encoding label
-                self.encoding_label.setText("UTF-8")
-                
-                # Add to recent files
-                self._add_to_recent_files(file_path)
-                
             except Exception as e:
+                if splash:
+                    splash.close()
                 QMessageBox.critical(self, "Error", f"Failed to open file: {str(e)}")
                 self.status_label.setText("Ready")
     
-    def _read_large_file(self, file_path: str) -> str:
-        """Read large files efficiently using chunked reading"""
-        content_parts = []
-        chunk_size = 64 * 1024  # 64KB chunks
+    def reread_file(self):
+        """Reload the current file from disk, discarding unsaved changes."""
+        if not self.current_file:
+            QMessageBox.information(self, "Reread File", "No file is currently open.")
+            return
+
+        if self.xml_editor.document().isModified():
+            reply = QMessageBox.question(
+                self, "Reread File",
+                "File has unsaved changes. Rereading will discard them.\nAre you sure?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        
+        # Reload using open_file logic
+        self.open_file(self.current_file)
+        self.status_label.setText(f"File reloaded: {self.current_file}")
+
+    def rename_file(self):
+        """Rename the current file on disk."""
+        if not self.current_file or not os.path.exists(self.current_file):
+            QMessageBox.warning(self, "Rename Error", "No file is currently active or file does not exist on disk.")
+            return
+            
+        old_path = self.current_file
+        
+        # Prompt for new name
+        new_path, _ = QFileDialog.getSaveFileName(
+            self, "Rename File", old_path, "XML Files (*.xml);;All Files (*.*)"
+        )
+        
+        if not new_path or os.path.abspath(new_path) == os.path.abspath(old_path):
+            return
+            
+        try:
+            # Rename on disk
+            os.rename(old_path, new_path)
+            
+            # Update internal state
+            self.current_file = new_path
+            self.xml_editor.file_path = new_path
+            
+            # Update UI
+            self._update_window_title()
+            if hasattr(self, 'tab_widget') and self.tab_widget:
+                idx = self.tab_widget.indexOf(self.xml_editor)
+                if idx >= 0:
+                    self.tab_widget.setTabText(idx, os.path.basename(new_path))
+                    self.tab_widget.setTabToolTip(idx, new_path)
+            
+            # Update recent files
+            if old_path in self.recent_files:
+                self.recent_files.remove(old_path)
+            self._add_to_recent_files(new_path) # This saves and updates menu
+            
+            self.status_label.setText(f"File renamed to: {new_path}")
+            
+        except OSError as e:
+            QMessageBox.critical(self, "Rename Error", f"Failed to rename file:\n{e}")
+
+    def open_containing_folder(self):
+        """Open the folder containing the current file."""
+        if not self.current_file:
+             QMessageBox.information(self, "Open Folder", "No file is currently open.")
+             return
+             
+        path_to_show = os.path.abspath(self.current_file)
         
         try:
+            if os.name == 'nt':
+                # Windows: select file in explorer
+                subprocess.Popen(['explorer', '/select,', path_to_show])
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', '-R', path_to_show])
+            else:
+                # Linux/Unix
+                folder = os.path.dirname(path_to_show)
+                subprocess.Popen(['xdg-open', folder])
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not open folder:\n{e}")
+
+    def _read_file_robust(self, file_path: str) -> str:
+        """Read files efficiently using chunked reading with encoding fallback"""
+        chunk_size = 64 * 1024  # 64KB chunks
+        
+        # Attempt 1: UTF-8
+        try:
+            content_parts = []
             with open(file_path, 'r', encoding='utf-8') as file:
                 while True:
                     chunk = file.read(chunk_size)
                     if not chunk:
                         break
                     content_parts.append(chunk)
-            
             return ''.join(content_parts)
-        except UnicodeDecodeError:
-            # Try with different encoding if UTF-8 fails
-            try:
-                with open(file_path, 'r', encoding='cp1251') as file:
-                    while True:
-                        chunk = file.read(chunk_size)
-                        if not chunk:
+        except Exception:
+            # If UTF-8 fails (UnicodeDecodeError or other), fall back to CP1251
+            pass
+            
+        # Attempt 2: CP1251
+        try:
+            content_parts = []
+            with open(file_path, 'r', encoding='cp1251') as file:
+                while True:
+                    chunk = file.read(chunk_size)
+                    if not chunk:
+                        break
+                    content_parts.append(chunk)
+            return ''.join(content_parts)
+        except Exception as e:
+            raise Exception(f"Failed to read file with any encoding: {str(e)}")
+    
+    
+    def _open_zip_workflow(self, zip_path: str):
+        """Handle opening of a zip file: detect XMLs, prompt user, extract to temp."""
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                # List XML files
+                xml_files = [f for f in z.namelist() if f.lower().endswith('.xml')]
+            
+            if not xml_files:
+                QMessageBox.warning(self, "Zip Error", "No XML files found in this archive.")
+                return
+
+            selected_arcname = None
+            if len(xml_files) == 1:
+                selected_arcname = xml_files[0]
+            else:
+                # Load default preference
+                settings = QSettings("visxml.net", "LotusXmlEditor")
+                default_pattern = settings.value("zip_default_file_pattern", "ExchangeRules.xml")
+                
+                default_index = 0
+                found = False
+                
+                # 1. Try saved preference
+                if default_pattern:
+                    for i, fname in enumerate(xml_files):
+                        if fname == default_pattern:
+                            default_index = i
+                            found = True
                             break
-                        content_parts.append(chunk)
-                return ''.join(content_parts)
-            except Exception as e:
-                raise Exception(f"Failed to read file with any encoding: {str(e)}")
+                
+                # 2. Fallback to ExchangeRules.xml if preference not found
+                if not found and default_pattern != "ExchangeRules.xml":
+                     for i, fname in enumerate(xml_files):
+                        if fname == "ExchangeRules.xml":
+                            default_index = i
+                            break
+                
+                # Let user choose
+                item, ok = QInputDialog.getItem(
+                    self, "Select XML from Archive", 
+                    "Found multiple XML files. Select one to open:", 
+                    xml_files, default_index, False
+                )
+                if ok and item:
+                    selected_arcname = item
+                    # Save preference
+                    settings.setValue("zip_default_file_pattern", item)
+            
+            if not selected_arcname:
+                return
+
+            # Use shared method to open the item
+            self._open_zip_item(zip_path, selected_arcname)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Zip Error", f"Failed to open zip archive: {e}")
+            
+    def _open_zip_item(self, zip_path: str, arc_name: str):
+        """Extract and open a specific file from a zip archive"""
+        try:
+            # Create temp directory
+            temp_dir = tempfile.mkdtemp(prefix="lotus_lxe_")
+            # Extract
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                z.extract(arc_name, path=temp_dir)
+            
+            extracted_path = os.path.join(temp_dir, arc_name)
+            
+            # Open the extracted file
+            self.open_file(extracted_path)
+            
+            # Set state to track origin
+            zip_source = {
+                'zip_path': zip_path,
+                'arc_name': arc_name,
+                'temp_dir': temp_dir
+            }
+            self.current_zip_source = zip_source
+            
+            # Also set on the editor widget for persistence
+            if hasattr(self, 'xml_editor') and self.xml_editor:
+                self.xml_editor.zip_source = zip_source
+            
+            # Update title to show context
+            self._update_window_title()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Zip Error", f"Failed to extract file from zip: {e}")
     
     def save_file(self):
         """Save current file"""
         if not self.current_file:
             self.save_file_as()
+            return
+
+        # Check if we are in Zip mode
+        # Use editor's zip_source if available, otherwise fallback to MainWindow's
+        zip_source = getattr(self.xml_editor, 'zip_source', None)
+        if not zip_source:
+             zip_source = self.current_zip_source
+
+        if zip_source and self.current_file.startswith(zip_source['temp_dir']):
+            # Save to temp first
+            try:
+                content = self.xml_editor.get_content()
+                with open(self.current_file, 'w', encoding='utf-8') as file:
+                    file.write(content)
+                
+                # Update Zip
+                zip_path = zip_source['zip_path']
+                arc_name = zip_source['arc_name']
+                
+                # Re-packaging approach for safety (standard "update zip" pattern):
+                # 1. Create new temp zip
+                # 2. Copy all files from old zip to new zip, EXCEPT the one we are updating.
+                # 3. Add the updated file.
+                # 4. Replace old zip with new zip.
+                
+                temp_zip_fd, temp_zip_path = tempfile.mkstemp(suffix=".zip")
+                os.close(temp_zip_fd)
+                
+                try:
+                    with zipfile.ZipFile(zip_path, 'r') as zin:
+                        with zipfile.ZipFile(temp_zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+                            zout.comment = zin.comment # preserve comment
+                            for item in zin.infolist():
+                                if item.filename != arc_name:
+                                    zout.writestr(item, zin.read(item.filename))
+                            # Now add our updated file
+                            zout.write(self.current_file, arc_name)
+                    
+                    # Replace original
+                    shutil.move(temp_zip_path, zip_path)
+                    
+                    self.status_label.setText(f"Saved to Archive: {os.path.basename(zip_path)}")
+                
+                except Exception as e:
+                    if os.path.exists(temp_zip_path):
+                        os.remove(temp_zip_path)
+                    raise e
+            
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to update zip archive: {str(e)}")
             return
         
         try:
@@ -3744,6 +6056,7 @@ class MainWindow(QMainWindow):
             with open(self.current_file, 'w', encoding='utf-8') as file:
                 file.write(content)
             
+            self.xml_editor.document().setModified(False)
             self.status_label.setText(f"Saved: {self.current_file}")
             
         except Exception as e:
@@ -3756,9 +6069,11 @@ class MainWindow(QMainWindow):
         )
         
         if file_path:
+            # Saving as a new file breaks the link to the zip
+            self.current_zip_source = None
             self.current_file = file_path
             self.save_file()
-            self.setWindowTitle(f"Lotus Xml Editor - {os.path.basename(file_path)}")
+            self._update_window_title()
     
     def undo(self):
         """Undo last action"""
@@ -3771,6 +6086,38 @@ class MainWindow(QMainWindow):
     def show_find_dialog(self):
         """Show find dialog"""
         dialog = FindDialog(self)
+        
+        # Check for selected text in active editor
+        selected_text = ""
+        try:
+            if hasattr(self, 'xml_editor') and self.xml_editor:
+                cursor = self.xml_editor.textCursor()
+                if cursor.hasSelection():
+                    selected_text = cursor.selectedText()
+        except Exception:
+            pass
+            
+        # Pre-fill with selected text or last search params
+        if selected_text:
+            dialog.find_input.setCurrentText(selected_text)
+            # Restore other options from last search
+            if self.last_search_params:
+                try:
+                    dialog.case_sensitive.setChecked(self.last_search_params.get('case_sensitive', False))
+                    dialog.whole_word.setChecked(self.last_search_params.get('whole_word', False))
+                    dialog.use_regex.setChecked(self.last_search_params.get('use_regex', False))
+                except Exception:
+                    pass
+        elif self.last_search_params:
+            try:
+                if 'text' in self.last_search_params:
+                    dialog.find_input.setCurrentText(self.last_search_params['text'])
+                dialog.case_sensitive.setChecked(self.last_search_params.get('case_sensitive', False))
+                dialog.whole_word.setChecked(self.last_search_params.get('whole_word', False))
+                dialog.use_regex.setChecked(self.last_search_params.get('use_regex', False))
+            except Exception:
+                pass
+        
         if dialog.exec() == QDialog.DialogCode.Accepted:
             params = dialog.get_search_params()
             self.find_text(params)
@@ -3941,95 +6288,157 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Settings Error", f"Failed to open settings: {e}")
     
     def show_hotkey_help(self):
-        """Show a dialog with a complete hotkey reference."""
+        """Show a dialog with a complete hotkey reference grouped by categories."""
         try:
-            shortcuts = [
-                "File:",
-                "  Ctrl+N  New",
-                "  Ctrl+O  Open",
-                "  Ctrl+S  Save",
-                "  Ctrl+Shift+S  Save As / Split XML (context)",
-                "  Ctrl+Q  Exit",
-                "",
-                "Edit:",
-                "  Ctrl+Z  Undo",
-                "  Ctrl+Y  Redo",
-                "  Ctrl+F  Find...",
-                "  F3      Find Next",
-                "  Ctrl+G  Go to Line...",
-                "  Ctrl+L  Delete current line or selected lines",
-                "  Ctrl+/  Toggle line comment (//) for selected lines",
-                "  Ctrl+Shift+Up    Move current/selected lines up",
-                "  Ctrl+Shift+Down  Move current/selected lines down",
-                "",
-                "Bookmarks:",
-                "  Ctrl+B        Toggle Bookmark at cursor",
-                "  Ctrl+Shift+B  Clear all bookmarks",
-                "  F2            Next Bookmark",
-                "  Alt+F2        Toggle Bookmark (menu)",
-                "  Ctrl+Alt+F2   Previous Bookmark",
-                "",
-                "Numbered Bookmarks:",
-                "  Ctrl+Shift+1..9  Set numbered bookmark (1-9)",
-                "  Ctrl+1..9        Go to numbered bookmark (1-9)",
-                "",
-                "XML:",
-                "  Ctrl+Shift+F  Format XML",
-                "  Ctrl+Shift+V  Validate XML",
-                "  Ctrl+Shift+T  Find in Tree",
-                "  Ctrl+Shift+C  Copy Current Node with Subnodes",
-                "  Ctrl+Shift+N  Open Node in New Window",
-                "  Ctrl+E        Export Tree",
-                "  Ctrl+Shift+S  Split XML...",
-                "",
-                "Code Folding:",
-                "  Ctrl+Shift+[  Fold current element",
-                "  Ctrl+Shift+]  Unfold current element",
-                "  Ctrl+Shift+0  Unfold all",
-                "",
-                "View:",
-                "  Ctrl+Shift+M  Open Multicolumn Tree (Experimental)",
-                "",
-                "Editor/Navigation:",
-                "  Ctrl+T        Find in Tree (editor)",
-                "  F4            Select XML node near cursor",
-                "  Ctrl+F4       Select root element",
-                "  Ctrl+Alt+F4   Cycle top-level elements",
-                "  F5            Move selection to new tab with link",
-                "  Shift+F5      Replace link with edited text from separate tab",
-                "  Alt+←/→/↑/↓   Tree-backed navigation",
-                "",
-                "Tree:",
-                "  Delete        Hide current node recursively (visual filter)",
-            ]
-
-            text = "\n".join(shortcuts)
+            from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem
+            
             dlg = QDialog(self)
             dlg.setWindowTitle("Keyboard Shortcuts")
             dlg.setModal(True)
-            dlg.resize(520, 500)
-            v = QVBoxLayout()
+            dlg.resize(600, 550)
+            
+            layout = QVBoxLayout()
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(6)
+            
             label = QLabel("These shortcuts are available across menus and the editor:")
             label.setWordWrap(True)
-            v.addWidget(label)
-            from PyQt6.QtWidgets import QTextEdit
-            te = QTextEdit()
-            te.setReadOnly(True)
-            te.setPlainText(text)
-            font = te.font()
-            font.setFamily("Consolas")
-            te.setFont(font)
-            v.addWidget(te)
+            label.setStyleSheet("font-size: 11px; margin-bottom: 4px;")
+            layout.addWidget(label)
+            
+            # Use QTreeWidget for better organization
+            tree = QTreeWidget()
+            tree.setHeaderHidden(True)
+            tree.setRootIsDecorated(True)
+            tree.setIndentation(12)
+            
+            # Define categories and shortcuts
+            categories = [
+                ("File Operations", [
+                    "Ctrl+N - New",
+                    "Ctrl+O - Open",
+                    "Ctrl+S - Save",
+                    "Ctrl+Shift+S - Save As / Split XML (context)",
+                    "Ctrl+R - Reread from Disk",
+                    "Ctrl+F2 - Rename File",
+                    "Alt+Shift+O - Open Containing Folder",
+                    "Ctrl+Q - Exit"
+                ]),
+                ("Editing Operations", [
+                    "Ctrl+Z - Undo",
+                    "Ctrl+Y - Redo",
+                    "Ctrl+F - Find...",
+                    "F3 - Find Next",
+                    "Shift+F3 - Find Previous",
+                    "Ctrl+H - Replace...",
+                    "Ctrl+Shift+H - Replace All",
+                    "Ctrl+G - Go to Line...",
+                    "Ctrl+L - Toggle Line Numbers / Delete Line (context)",
+                    "Ctrl+/ - Toggle comment (context sensitive)",
+                    "Ctrl+\\ - Cycle syntax language",
+                    "Ctrl+Shift+Up - Move lines up",
+                    "Ctrl+Shift+Down - Move lines down",
+                    "Ctrl+Shift+K - Escape XML Entities (selection)",
+                    "Ctrl+Alt+U - Unescape XML Entities (selection)"
+                ]),
+                ("Bookmarks", [
+                    "Ctrl+B - Toggle Bookmark at cursor",
+                    "Ctrl+Shift+B - Clear all bookmarks / Tab Bar Autohide (context)",
+                    "F2 - Next Bookmark",
+                    "Shift+F2 - Previous Bookmark",
+                    "Alt+F2 - Toggle Bookmark (menu)"
+                ]),
+                ("XPath Links", [
+                    "Ctrl+F11 - Copy XPath of current position to Links",
+                    "F12 - Navigate to XPath from Links tab"
+                ]),
+                ("Numbered Bookmarks", [
+                    "Ctrl+Shift+1..9 - Set numbered bookmark",
+                    "Ctrl+1..9 - Go to numbered bookmark"
+                ]),
+                ("XML Operations", [
+                    "Ctrl+Shift+F - Format XML",
+                    "Ctrl+Shift+V - Validate XML",
+                    "Ctrl+Shift+T - Find in Tree / Toolbar Autohide (context)",
+                    "Ctrl+Shift+C - Copy Current Node with Subnodes",
+                    "Ctrl+Shift+N - Open Node in New Window",
+                    "Ctrl+E - Export Tree",
+                    "F11 - Rebuild Tree with auto-close tags",
+                    "Shift+F11 - Toggle Update Tree on Tab Switch"
+                ]),
+                ("Code Folding", [
+                    "Ctrl+Shift+[ - Fold current element",
+                    "Ctrl+Shift+] - Unfold current element",
+                    "Ctrl+Shift+U - Unfold all",
+                    "Alt+2..9 - Fold all elements at level N"
+                ]),
+                ("Navigation & Selection", [
+                    "Ctrl+T - Find in Tree (editor)",
+                    "F4 - Select XML node near cursor",
+                    "Ctrl+F4 - Select root element",
+                    "Ctrl+Alt+F4 - Cycle top-level elements",
+                    "F5 - Move selection to new tab with link",
+                    "Shift+F5 - Replace link with edited text from separate tab",
+                    "F6 - Navigate Tree Up",
+                    "F7 - Navigate Tree Down",
+                    "F8 - Open selected fragment in new window",
+                    "Alt+←/→/↑/↓ - Tree-backed navigation",
+                    "Ctrl+] - Jump to matching closing tag",
+                    "Ctrl+[ - Jump to matching opening tag"
+                ]),
+                ("View", [
+                    "F9 - Toggle Bottom Panel",
+                    "Ctrl+M - XML Metro Navigator",
+                    "Ctrl+Shift+M - Open Multicolumn Tree (Experimental)",
+                    "Ctrl+Shift+E - Toggle Tree Column Header Autohide",
+                    "Ctrl+Shift+H - Toggle Tree Header Autohide / Replace All (context)"
+                ]),
+                ("Binary File Transfer", [
+                    "Win+Ctrl+Ins - Encode file from clipboard to base64 text",
+                    "Win+Shift+Ins - Decode base64 text from clipboard to file"
+                ]),
+                ("Tree Operations", [
+                    "Delete - Hide current node recursively (visual filter)",
+                    "Ctrl+Delete - Delete XML Block (Model)",
+                    "Ctrl+/ - Hide XML Block (Comment out)",
+                    "Right Click - Context Menu (Delete/Hide Block)"
+                ])
+            ]
+            
+            # Populate tree
+            for category_name, shortcuts in categories:
+                category_item = QTreeWidgetItem(tree)
+                category_item.setText(0, f"📁 {category_name}")
+                category_item.setExpanded(True)
+                
+                for shortcut in shortcuts:
+                    item = QTreeWidgetItem(category_item)
+                    item.setText(0, f"  {shortcut}")
+            
+            tree.resizeColumnToContents(0)
+            layout.addWidget(tree)
+            
+            # Close button
             buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
             buttons.rejected.connect(dlg.reject)
-            v.addWidget(buttons)
-            dlg.setLayout(v)
+            layout.addWidget(buttons)
+            
+            dlg.setLayout(layout)
             dlg.exec()
         except Exception as e:
             try:
-                QMessageBox.information(self, "Shortcuts", f"Hotkey list:\n\n{text}")
+                QMessageBox.information(self, "Shortcuts", f"Error loading help: {e}")
             except Exception:
                 print(f"Error showing hotkey help: {e}")
+    
+    def show_about_dialog(self):
+        """Show About dialog with application and file information"""
+        try:
+            current_file = self.current_file if hasattr(self, 'current_file') else None
+            dialog = AboutDialog(self, current_file)
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.warning(self, "About Error", f"Failed to show About dialog: {e}")
     
     def find_text(self, params: dict):
         """Find text in editor"""
@@ -4101,8 +6510,30 @@ class MainWindow(QMainWindow):
     
     def find_next(self):
         """Find next occurrence (F3)"""
+        # Only check for selection if editor has focus to avoid crashes
+        try:
+            if self.xml_editor.hasFocus() and self.xml_editor.textCursor().hasSelection():
+                selected_text = self.xml_editor.textCursor().selectedText()
+                if len(selected_text) > 0:
+                    # Check if selected text is different from current search term
+                    # If it's the same, just move to next occurrence instead of restarting search
+                    current_search_text = self.last_search_params.get('text', '') if self.last_search_params else ''
+                    if selected_text != current_search_text:
+                        # New search term - start fresh search
+                        self.last_search_term = selected_text
+                        self.find_text({
+                            'text': selected_text,
+                            'case_sensitive': False,
+                            'whole_word': False,
+                            'use_regex': False
+                        })
+                        return
+        except Exception as e:
+            # If there's any issue checking selection, just continue with existing search
+            print(f"Error checking selection in find_next: {e}")
+
         if not self.last_search_results or self.current_search_index == -1:
-            # No previous search, show find dialog
+            # No previous search and no selection, show find dialog
             self.show_find_dialog()
             return
         
@@ -4110,12 +6541,25 @@ class MainWindow(QMainWindow):
         self.current_search_index = (self.current_search_index + 1) % len(self.last_search_results)
         self._navigate_to_search_result(self.current_search_index)
     
+    def find_previous(self):
+        """Find previous occurrence (Shift+F3)"""
+        if not self.last_search_results or self.current_search_index == -1:
+            # No previous search, show find dialog
+            self.show_find_dialog()
+            return
+        
+        # Move to previous result (wrap around to end if at beginning)
+        self.current_search_index = (self.current_search_index - 1) % len(self.last_search_results)
+        self._navigate_to_search_result(self.current_search_index)
+    
     def _navigate_to_search_result(self, result_index: int):
         """Navigate to a specific search result"""
         if not self.last_search_results or result_index < 0 or result_index >= len(self.last_search_results):
+            print(f"DEBUG: Cannot navigate - invalid index {result_index} or no results")
             return
         
         line_num, col_start, col_end = self.last_search_results[result_index]
+        print(f"DEBUG: Navigating to result {result_index}: line {line_num}, col {col_start}-{col_end}")
         
         # Navigate to the line
         cursor = self.xml_editor.textCursor()
@@ -4207,28 +6651,61 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to format XML: {str(e)}")
     
-    def rebuild_tree_with_autoclose(self):
-        """Rebuild tree from editor content with auto-close unclosed tags"""
-        content = self.xml_editor.get_content()
-        if not content.strip():
-            self.status_label.setText("No content to rebuild")
-            return
+    def show_progress_tip(self, text):
+        """Show a floating progress tip"""
+        if hasattr(self, '_progress_popup') and self._progress_popup:
+             try:
+                 self._progress_popup.close()
+                 self._progress_popup.deleteLater()
+             except Exception:
+                 pass
         
+        self._progress_popup = ProgressPopup(text, self)
+        # Position at center of window
+        geo = self.geometry()
+        center = geo.center()
+        # Adjust for popup size (approx)
+        self._progress_popup.move(center.x() - 100, center.y() - 20)
+        self._progress_popup.show()
+        QApplication.processEvents()
+
+    def hide_progress_tip(self):
+        """Hide the progress tip"""
+        if hasattr(self, '_progress_popup') and self._progress_popup:
+             try:
+                 self._progress_popup.close()
+                 self._progress_popup.deleteLater()
+             except Exception:
+                 pass
+             self._progress_popup = None
+
+    def _on_autoclose_finished(self, fixed_content, modified):
+        """Handle completion of auto-close worker"""
         try:
-            # Auto-close any unclosed tags
-            fixed_content = self.xml_service.auto_close_tags(content)
-            
             # Check if content was modified
-            if fixed_content != content:
+            if modified:
                 # Update editor with fixed content
-                self.xml_editor.set_content(fixed_content)
+                if hasattr(self, 'xml_editor'):
+                    self.xml_editor.set_content(fixed_content)
                 self.status_label.setText("Auto-closed unclosed tags and rebuilt tree")
             else:
                 self.status_label.setText("Rebuilt tree (no unclosed tags found)")
             
-            # Rebuild the tree
-            self.xml_tree.populate_tree(fixed_content)
+            # Rebuild the tree (forcing async to keep UI responsive)
+            # Update popup text
+            if hasattr(self, '_progress_popup') and self._progress_popup:
+                self._progress_popup.label.setText("Populating tree...")
+                QApplication.processEvents()
+                
+            self.xml_tree.populate_tree(fixed_content, show_progress=False, force_async=True)
             
+            # We need to know when populate_tree finishes to hide the popup.
+            # XmlTreeWidget stores the worker in self._parse_worker.
+            if hasattr(self.xml_tree, '_parse_worker') and self.xml_tree._parse_worker:
+                 self.xml_tree._parse_worker.finished.connect(self.hide_progress_tip)
+            else:
+                 self.hide_progress_tip()
+
             # Reset caches and optionally rebuild index
             try:
                 self.path_line_cache = {}
@@ -4237,10 +6714,37 @@ class MainWindow(QMainWindow):
                     self._build_path_line_index(fixed_content)
             except Exception:
                 pass
-            
+                
         except Exception as e:
+            self.hide_progress_tip()
             QMessageBox.critical(self, "Error", f"Failed to rebuild tree: {str(e)}")
             self.status_label.setText(f"Error rebuilding tree: {str(e)}")
+
+    def rebuild_tree_with_autoclose(self):
+        """Rebuild tree from editor content with auto-close unclosed tags"""
+        content = self.xml_editor.get_content()
+        if not content.strip():
+            self.status_label.setText("No content to rebuild")
+            return
+        
+        try:
+            # Hide rebuild indicator
+            self._tree_needs_rebuild = False
+            if hasattr(self, 'tree_rebuild_indicator'):
+                self.tree_rebuild_indicator.setVisible(False)
+            
+            self.show_progress_tip("Auto-closing tags...")
+            self.status_label.setText("Rebuilding tree...")
+            
+            # Start worker
+            self.autoclose_worker = AutoCloseWorker(content, self.xml_service)
+            self.autoclose_worker.finished.connect(self._on_autoclose_finished)
+            self.autoclose_worker.start()
+            
+        except Exception as e:
+            self.hide_progress_tip()
+            QMessageBox.critical(self, "Error", f"Failed to start rebuild: {str(e)}")
+            self.status_label.setText(f"Error starting rebuild: {str(e)}")
     
     def validate_xml(self):
         """Validate XML content"""
@@ -4457,6 +6961,18 @@ Total size: {stats.total_size} bytes"""
         if getattr(self, '_loading_file', False):
             return
         
+        # Check if timer is initialized
+        if not hasattr(self, 'tree_update_timer'):
+            return
+        
+        # Check if auto rebuild is enabled
+        if not getattr(self, 'auto_rebuild_tree', True):
+            # Show indicator that tree needs rebuild
+            self._tree_needs_rebuild = True
+            if hasattr(self, 'tree_rebuild_indicator'):
+                self.tree_rebuild_indicator.setVisible(True)
+            return
+        
         # Store content and restart debounce timer
         self._pending_tree_content = self.xml_editor.get_content()
         self.tree_update_timer.stop()
@@ -4470,19 +6986,41 @@ Total size: {stats.total_size} bytes"""
         content = self._pending_tree_content
         self._pending_tree_content = None
         
-        self.xml_tree.populate_tree(content)
-        # Reset caches and optionally rebuild index based on new content size
+        self.xml_tree.populate_tree(content, file_path=None)
+        
+        # Notify metro navigator if it's open
+        if hasattr(self, 'metro_window') and self.metro_window and self.metro_window.isVisible():
+            try:
+                self.metro_window.show_refresh_button()
+            except Exception as e:
+                print(f"Error notifying metro navigator: {e}")
+        
+        # Optimization: If lxml is available, the tree nodes already have line numbers (from sourceline).
+        # We don't need to rebuild the independent index unless we're in fallback mode.
         try:
-            lines_count = len(content.split('\n')) if content else 0
-            self.sync_index_enabled = lines_count > 8000
-            self.sync_cache_enabled = lines_count > 8000
-            self.path_line_cache = {}
-            self.path_line_index = {}
-            if self.sync_index_enabled:
-                self._build_path_line_index(content)
-                self._debug_print(f"DEBUG: Rebuilt index after content change, entries={len(self.path_line_index)}")
+            # Check availability via XmlService import or local flag
+            try:
+                from lxml import etree
+                lxml_available = True
+            except ImportError:
+                lxml_available = False
+
+            if lxml_available:
+                 # Skip redundant indexing
+                 self.sync_index_enabled = False
+                 self._debug_print("DEBUG: Using direct lxml sourceline support (skipping separate index)")
             else:
-                self._debug_print("DEBUG: Index/cache disabled after content change (small file)")
+                # Fallback logic for ElementTree
+                lines_count = len(content.split('\n')) if content else 0
+                self.sync_index_enabled = lines_count > 8000
+                self.sync_cache_enabled = lines_count > 8000
+                self.path_line_cache = {}
+                self.path_line_index = {}
+                if self.sync_index_enabled:
+                    self._build_path_line_index(content)
+                    self._debug_print(f"DEBUG: Rebuilt index after content change, entries={len(self.path_line_index)}")
+                else:
+                    self._debug_print("DEBUG: Index/cache disabled after content change (small file)")
         except Exception as e:
             self._debug_print(f"DEBUG: Error handling index/cache on content change: {e}")
         
@@ -4525,7 +7063,10 @@ Total size: {stats.total_size} bytes"""
         self.line_label.setText(f"Ln: {line}, Col: {column}")
         
         # Update breadcrumb based on current cursor position
-        self._update_breadcrumb_from_cursor(line)
+        # Only if visible and not in Spartan Mode (to avoid heavy get_content calls)
+        is_spartan = getattr(self, 'spartan_mode', False)
+        if hasattr(self, 'breadcrumb_label') and self.breadcrumb_label.isVisible() and not is_spartan:
+            self._update_breadcrumb_from_cursor(line)
         
         # Sync tree selection to current cursor position (backward sync) when enabled
         if getattr(self, 'sync_enabled', False):
@@ -4856,7 +7397,7 @@ Total size: {stats.total_size} bytes"""
     
     def _get_element_path_at_line(self, xml_content: str, line_number: int) -> str:
         """Get the proper XPath of the element at the given line number using XML parsing"""
-        print(f"DEBUG: _get_element_path_at_line called with line_number={line_number}")
+        self._debug_print(f"DEBUG: _get_element_path_at_line called with line_number={line_number}")
         try:
             import xml.etree.ElementTree as ET
             
@@ -4865,18 +7406,18 @@ Total size: {stats.total_size} bytes"""
             
             # Find the element at the given line by parsing line by line
             lines = xml_content.split('\n')
-            print(f"DEBUG: Total lines in content: {len(lines)}")
+            self._debug_print(f"DEBUG: Total lines in content: {len(lines)}")
             
             if line_number <= 0 or line_number > len(lines):
-                print(f"DEBUG: Line number {line_number} out of range")
+                self._debug_print(f"DEBUG: Line number {line_number} out of range")
                 return ""
             
             target_line = lines[line_number - 1].strip()
-            print(f"DEBUG: Processing line {line_number}: '{target_line}'")
+            self._debug_print(f"DEBUG: Processing line {line_number}: '{target_line}'")
             
             # Extract tag name from the target line
             if not target_line.startswith('<') or target_line.startswith('<!--'):
-                print(f"DEBUG: Line is not an opening tag")
+                self._debug_print(f"DEBUG: Line is not an opening tag")
                 return ""
             
             # Find tag name
@@ -4896,7 +7437,7 @@ Total size: {stats.total_size} bytes"""
             else:
                 tag_name = tag_content.strip()
             
-            print(f"DEBUG: Looking for tag: {tag_name}")
+            self._debug_print(f"DEBUG: Looking for tag: {tag_name}")
             
             # Build element path map with parent relationships
             element_paths = {}
@@ -4906,10 +7447,10 @@ Total size: {stats.total_size} bytes"""
             target_element_path = self._find_element_path_at_line(root, tag_name, line_number, xml_content, element_paths)
             
             if target_element_path:
-                print(f"DEBUG: Generated path: {target_element_path}")
+                self._debug_print(f"DEBUG: Generated path: {target_element_path}")
                 return target_element_path
             else:
-                print(f"DEBUG: Could not find element at line {line_number}")
+                self._debug_print(f"DEBUG: Could not find element at line {line_number}")
                 return ""
                 
         except Exception as e:
@@ -5547,32 +8088,32 @@ Total size: {stats.total_size} bytes"""
         3) Parent-anchored subtree search
         4) Chunked full-file scan (no 10k cap)
         """
-        print(f"DEBUG: _find_element_line_by_path called with path: {element_path}")
+        self._debug_print(f"DEBUG: _find_element_line_by_path called with path: {element_path}")
 
         if not element_path or element_path == "/":
-            print(f"DEBUG: Returning line 1 for root element")
+            self._debug_print(f"DEBUG: Returning line 1 for root element")
             return 1  # Root element
 
         # Cache fast path
         if self.sync_cache_enabled and element_path in self.path_line_cache:
             line_cached = self.path_line_cache[element_path]
-            print(f"DEBUG: Cache hit for {element_path} -> line {line_cached}")
+            self._debug_print(f"DEBUG: Cache hit for {element_path} -> line {line_cached}")
             return line_cached
 
         lines = content.split('\n')
         path_parts = element_path.split('/')[1:]  # Remove leading empty string
 
         if not path_parts:
-            print(f"DEBUG: No path parts, returning 0")
+            self._debug_print(f"DEBUG: No path parts, returning 0")
             return 0
 
-        print(f"DEBUG: Processing {len(lines)} lines for path parts: {path_parts}")
+        self._debug_print(f"DEBUG: Processing {len(lines)} lines for path parts: {path_parts}")
 
         # lxml index lookup
         if self.sync_index_enabled and self._sync_index_available:
             if element_path in self.path_line_index:
                 line = self.path_line_index[element_path]
-                print(f"DEBUG: Index hit for {element_path} -> line {line}")
+                self._debug_print(f"DEBUG: Index hit for {element_path} -> line {line}")
                 if self.sync_cache_enabled:
                     self.path_line_cache[element_path] = line
                 return line
@@ -5606,7 +8147,7 @@ Total size: {stats.total_size} bytes"""
             return expected_tag_name, expected_index, expected_attr_value
 
         if parent_line > 0:
-            print(f"DEBUG: Anchored search from parent path {parent_path} at line {parent_line}")
+            self._debug_print(f"DEBUG: Anchored search from parent path {parent_path} at line {parent_line}")
             parent_tag, parent_idx, _ = _parse_part(path_parts[-2])
             depth = 0
             start_index = max(parent_line - 1, 0)
@@ -5660,19 +8201,19 @@ Total size: {stats.total_size} bytes"""
                         if tn == exp_tag:
                             if exp_attr and f'Наименование="{exp_attr}"' in line_stripped:
                                 if current_depth == len(relative_parts):
-                                    print(f"DEBUG: Anchored match (attr) at line {i}")
+                                    self._debug_print(f"DEBUG: Anchored match (attr) at line {i}")
                                     if self.sync_cache_enabled:
                                         self.path_line_cache[element_path] = i
                                     return i
                             elif exp_idx == tag_index:
                                 if current_depth == len(relative_parts):
-                                    print(f"DEBUG: Anchored match at line {i}")
+                                    self._debug_print(f"DEBUG: Anchored match at line {i}")
                                     if self.sync_cache_enabled:
                                         self.path_line_cache[element_path] = i
                                     return i
                             elif exp_idx == 1 and not exp_attr and tag_index == 1:
                                 if current_depth == len(relative_parts):
-                                    print(f"DEBUG: Anchored simple match at line {i}")
+                                    self._debug_print(f"DEBUG: Anchored simple match at line {i}")
                                     if self.sync_cache_enabled:
                                         self.path_line_cache[element_path] = i
                                     return i
@@ -5723,19 +8264,19 @@ Total size: {stats.total_size} bytes"""
                         if tn == exp_tag:
                             if exp_attr and f'Наименование="{exp_attr}"' in line_stripped:
                                 if current_depth == len(path_parts):
-                                    print(f"DEBUG: Found target element by attribute at line {i}")
+                                    self._debug_print(f"DEBUG: Found target element by attribute at line {i}")
                                     if self.sync_cache_enabled:
                                         self.path_line_cache[element_path] = i
                                     return i
                             elif exp_idx == tag_index:
                                 if current_depth == len(path_parts):
-                                    print(f"DEBUG: Found target element at line {i}")
+                                    self._debug_print(f"DEBUG: Found target element at line {i}")
                                     if self.sync_cache_enabled:
                                         self.path_line_cache[element_path] = i
                                     return i
                             elif exp_idx == 1 and not exp_attr and tag_index == 1:
                                 if current_depth == len(path_parts):
-                                    print(f"DEBUG: Found target element by simple match at line {i}")
+                                    self._debug_print(f"DEBUG: Found target element by simple match at line {i}")
                                     if self.sync_cache_enabled:
                                         self.path_line_cache[element_path] = i
                                     return i
@@ -5743,7 +8284,7 @@ Total size: {stats.total_size} bytes"""
                     if not self_closing:
                         element_stack.append((tn, tag_index))
 
-        print(f"DEBUG: Element not found, returning 0")
+        self._debug_print(f"DEBUG: Element not found, returning 0")
         return 0
     
     def _find_element_end_line(self, content: str, tag_name: str, start_line: int) -> int:
@@ -5873,8 +8414,188 @@ Total size: {stats.total_size} bytes"""
             except Exception:
                 pass  # Silently fail for auto-save
     
+    def _save_session(self):
+        """Save current session state to file"""
+        try:
+            session = {
+                'tabs': [],
+                'active_tab_index': self.tab_widget.currentIndex(),
+                'find_results': [],
+                'last_search_params': self.last_search_params,
+                'last_search_results': self.last_search_results,
+                'fragment_editors': []
+            }
+            
+            # Save tabs
+            for i in range(self.tab_widget.count()):
+                widget = self.tab_widget.widget(i)
+                if isinstance(widget, XmlEditorWidget):
+                    tab_data = {
+                        'file_path': widget.file_path,
+                        'cursor_position': widget.textCursor().position(),
+                        'scroll_position': widget.verticalScrollBar().value(),
+                        'bookmarks': widget.bookmarks,
+                        'numbered_bookmarks': widget.numbered_bookmarks
+                    }
+                    
+                    # Save zip source if present
+                    if getattr(widget, 'zip_source', None):
+                        tab_data['zip_source'] = widget.zip_source
+                    
+                    if widget._folded_ranges:
+                         tab_data['folded_ranges'] = list(widget._folded_ranges)
+                    
+                    if widget.file_path or getattr(widget, 'zip_source', None):
+                        session['tabs'].append(tab_data)
+            
+            # Save find results
+            if hasattr(self, 'bottom_panel') and hasattr(self.bottom_panel, 'find_results'):
+                for i in range(self.bottom_panel.find_results.count()):
+                    item = self.bottom_panel.find_results.item(i)
+                    session['find_results'].append(item.text())
+            
+            # Save fragment editors
+            if hasattr(self, 'fragment_editors'):
+                for dialog in self.fragment_editors:
+                    if dialog.isVisible():
+                        frag_data = {
+                            'content': dialog.editor.toPlainText(),
+                            'language': dialog.syntax_group.checkedButton().text() if dialog.syntax_group.checkedButton() else 'XML',
+                            'geometry': dialog.saveGeometry().toBase64().data().decode('ascii')
+                        }
+                        session['fragment_editors'].append(frag_data)
+                        
+            session_path = os.path.join(os.path.expanduser("~"), ".lotus_xml_editor_session.json")
+            with open(session_path, 'w', encoding='utf-8') as f:
+                json.dump(session, f, indent=2)
+                
+        except Exception as e:
+            print(f"Error saving session: {e}")
+
+    def _restore_session(self):
+        """Restore session state from file"""
+        try:
+            session_path = os.path.join(os.path.expanduser("~"), ".lotus_xml_editor_session.json")
+            if not os.path.exists(session_path):
+                return
+                
+            with open(session_path, 'r', encoding='utf-8') as f:
+                session = json.load(f)
+            
+            # Restore tabs
+            if 'tabs' in session and session['tabs']:
+                # Close initial empty tab if present and unmodified
+                if self.tab_widget.count() == 1:
+                    widget = self.tab_widget.widget(0)
+                    if isinstance(widget, XmlEditorWidget) and not widget.file_path and not widget.get_content().strip():
+                        self.tab_widget.removeTab(0)
+                
+                for tab_data in session['tabs']:
+                    file_path = tab_data.get('file_path')
+                    zip_source = tab_data.get('zip_source')
+                    
+                    # Determine if we can open this tab
+                    can_open = False
+                    if zip_source and os.path.exists(zip_source['zip_path']):
+                        can_open = True
+                    elif file_path and os.path.exists(file_path):
+                        can_open = True
+                        
+                    if can_open:
+                        # Create new tab if needed
+                        current_has_file = False
+                        if hasattr(self, 'xml_editor') and self.xml_editor:
+                            if self.xml_editor.file_path or getattr(self.xml_editor, 'zip_source', None):
+                                current_has_file = True
+                                
+                        if self.tab_widget.count() == 0 or current_has_file:
+                             new_editor = XmlEditorWidget()
+                             
+                             # Apply line numbers setting
+                             show_line_numbers = self._read_flag('show_line_numbers', False)
+                             new_editor.set_line_numbers_visible(show_line_numbers)
+                             
+                             self.tab_widget.addTab(new_editor, "Document")
+                             self.tab_widget.setCurrentWidget(new_editor)
+                             # Force update of xml_editor reference since signals might be queued
+                             self.xml_editor = new_editor
+                             self.current_file = None
+                             # Connect signals for the new editor
+                             self.xml_editor.content_changed.connect(self.on_content_changed)
+                             self.xml_editor.cursor_position_changed.connect(self.on_cursor_changed)
+                        
+                        # Open file
+                        if zip_source:
+                            self._open_zip_item(zip_source['zip_path'], zip_source['arc_name'])
+                        else:
+                            self.open_file(file_path)
+                            
+                        editor = self.xml_editor
+                        
+                        # Restore state
+                        if 'cursor_position' in tab_data:
+                            cursor = editor.textCursor()
+                            cursor.setPosition(tab_data['cursor_position'])
+                            editor.setTextCursor(cursor)
+                        
+                        if 'scroll_position' in tab_data:
+                            editor.verticalScrollBar().setValue(tab_data['scroll_position'])
+                            
+                        if 'bookmarks' in tab_data:
+                            bookmarks = {int(k): v for k, v in tab_data['bookmarks'].items()}
+                            editor.bookmarks = bookmarks
+                            
+                        if 'numbered_bookmarks' in tab_data:
+                            editor.numbered_bookmarks = {int(k): int(v) for k, v in tab_data['numbered_bookmarks'].items()}
+
+                        if 'folded_ranges' in tab_data:
+                             editor._folded_ranges = [tuple(x) for x in tab_data['folded_ranges']]
+                
+                # Restore active tab
+                if 'active_tab_index' in session:
+                    idx = session['active_tab_index']
+                    if 0 <= idx < self.tab_widget.count():
+                        self.tab_widget.setCurrentIndex(idx)
+
+            # Restore find results
+            if 'find_results' in session and session['find_results']:
+                self.bottom_panel.clear_find_results()
+                for text in session['find_results']:
+                    self.bottom_panel.add_find_result(text)
+                self.last_search_results = session.get('last_search_results', [])
+                self.last_search_params = session.get('last_search_params')
+                if self.last_search_results:
+                     self._show_bottom_panel_auto("find")
+
+            # Restore fragment editors
+            if 'fragment_editors' in session:
+                for frag_data in session['fragment_editors']:
+                    text = frag_data.get('content', '')
+                    lang = frag_data.get('language', 'XML')
+                    
+                    dialog = FragmentEditorDialog(text, self.language_registry, initial_language=lang, parent=self)
+                    dialog.setWindowFlags(Qt.WindowType.Window)
+                    
+                    if 'geometry' in frag_data:
+                        try:
+                            dialog.restoreGeometry(QByteArray.fromBase64(frag_data['geometry'].encode('ascii')))
+                        except:
+                            pass
+                            
+                    dialog.show()
+                    
+                    if not hasattr(self, 'fragment_editors'):
+                        self.fragment_editors = []
+                    self.fragment_editors.append(dialog)
+                    dialog.finished.connect(lambda result, d=dialog: self.fragment_editors.remove(d) if d in self.fragment_editors else None)
+
+        except Exception as e:
+            print(f"Error restoring session: {e}")
+
     def closeEvent(self, event):
         """Handle close event"""
+        self._save_session()
+        
         # Clean up auto-save file
         if self.current_file:
             auto_save_path = self.current_file + '.autosave'
@@ -6135,6 +8856,8 @@ Total size: {stats.total_size} bytes"""
                     self.bottom_panel.setCurrentWidget(self.bottom_panel.bookmarks_tab)
                 elif tab_name == "find":
                     self.bottom_panel.setCurrentWidget(self.bottom_panel.find_tab)
+                elif tab_name == "links":
+                    self.bottom_panel.setCurrentWidget(self.bottom_panel.links_tab)
                 elif tab_name == "validation":
                     self.bottom_panel.setCurrentWidget(self.bottom_panel.validation_tab)
         except Exception as e:
@@ -6234,6 +8957,76 @@ Total size: {stats.total_size} bytes"""
         except Exception as e:
             print(f"Error opening multicolumn tree: {e}")
             self.status_label.setText(f"Error opening multicolumn tree: {str(e)}")
+    
+    def open_metro_navigator(self):
+        """Open XML Metro Navigator window"""
+        try:
+            # Check if tree is built
+            if self.xml_tree.topLevelItemCount() == 0:
+                # No tree built - show message and offer to open file
+                reply = QMessageBox.question(
+                    self,
+                    "No XML Tree",
+                    "The XML tree has not been built yet.\n\n"
+                    "Would you like to open an XML file?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.open_file()
+                return
+            
+            # Get root node from tree
+            root_item = self.xml_tree.topLevelItem(0)
+            if not root_item or not hasattr(root_item, 'xml_node'):
+                QMessageBox.information(
+                    self,
+                    "No XML Tree",
+                    "Please open and parse an XML file first.\n\n"
+                    "The tree structure is required for the Metro Navigator."
+                )
+                return
+            
+            root_node = root_item.xml_node
+            
+            # Create and show metro navigator window
+            self.metro_window = MetroNavigatorWindow(root_node, parent=self)
+            
+            # Connect signals for synchronization
+            self.metro_window.node_selected.connect(self.sync_editor_to_node)
+            
+            self.metro_window.show()
+            self.status_label.setText("Opened XML Metro Navigator")
+            
+        except Exception as e:
+            print(f"Error opening metro navigator: {e}")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to open Metro Navigator:\n{str(e)}"
+            )
+            self.status_label.setText(f"Error opening metro navigator: {str(e)}")
+    
+    def sync_editor_to_node(self, xml_node: XmlTreeNode):
+        """Sync editor cursor to selected node from metro navigator"""
+        try:
+            if xml_node and xml_node.line_number > 0:
+                # Move cursor to line in editor
+                cursor = self.xml_editor.textCursor()
+                cursor.movePosition(cursor.MoveOperation.Start)
+                cursor.movePosition(
+                    cursor.MoveOperation.Down,
+                    cursor.MoveMode.MoveAnchor,
+                    xml_node.line_number - 1
+                )
+                self.xml_editor.setTextCursor(cursor)
+                self.xml_editor.ensureCursorVisible()
+                self.status_label.setText(f"Jumped to line {xml_node.line_number}: {xml_node.name}")
+        except Exception as e:
+            print(f"Error syncing editor to node: {e}")
+            self.status_label.setText(f"Error syncing to node: {str(e)}")
+    
     
     def _extract_node_xml(self, xml_node, tree_item):
         """Extract XML content for a node and all its subnodes"""
@@ -6498,6 +9291,87 @@ Total size: {stats.total_size} bytes"""
         except Exception:
             pass
 
+    def copy_xpath_link(self):
+        """Copy XPath of current cursor position to Links tab (Ctrl+F11)"""
+        try:
+            # Get current cursor position
+            cursor = self.xml_editor.textCursor()
+            line_number = cursor.blockNumber() + 1
+            
+            # Get XML content
+            content = self.xml_editor.get_content()
+            if not content.strip():
+                self.status_label.setText("No XML content to get XPath from")
+                return
+            
+            # Get XPath for current line
+            xpath = self._get_element_path_at_line(content, line_number)
+            
+            if xpath:
+                # Add XPath to Links tab (append new line)
+                current_text = self.bottom_panel.links_text.toPlainText()
+                if current_text and not current_text.endswith('\n'):
+                    current_text += '\n'
+                self.bottom_panel.links_text.setPlainText(current_text + xpath)
+                
+                # Move cursor to end
+                cursor = self.bottom_panel.links_text.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self.bottom_panel.links_text.setTextCursor(cursor)
+                
+                # Show Links tab
+                self._show_bottom_panel_auto("links")
+                
+                self.status_label.setText(f"XPath copied to Links: {xpath}")
+            else:
+                self.status_label.setText(f"Could not determine XPath for line {line_number}")
+                
+        except Exception as e:
+            self.status_label.setText(f"Error copying XPath: {str(e)}")
+            print(f"Error in copy_xpath_link: {e}")
+
+    def navigate_xpath_link(self):
+        """Navigate to XPath from current line in Links tab (F12)"""
+        try:
+            # Get current line from Links tab
+            cursor = self.bottom_panel.links_text.textCursor()
+            cursor.select(QTextCursor.SelectionType.LineUnderCursor)
+            xpath = cursor.selectedText().strip()
+            
+            if not xpath:
+                self.status_label.setText("No XPath link on current line")
+                return
+            
+            # Get XML content
+            content = self.xml_editor.get_content()
+            if not content.strip():
+                self.status_label.setText("No XML content to navigate")
+                return
+            
+            # Find line number for this XPath
+            line_number = self._find_element_line_by_path(content, xpath)
+            
+            if line_number > 0:
+                # Navigate to the line
+                self.goto_line(line_number)
+                self.status_label.setText(f"Navigated to XPath: {xpath} (line {line_number})")
+                
+                # Try to select the node in tree if available
+                try:
+                    if hasattr(self, 'xml_tree') and self.xml_tree:
+                        item = self._find_tree_item_by_path(xpath)
+                        if item:
+                            self.xml_tree.setCurrentItem(item)
+                            self.xml_tree.scrollToItem(item)
+                except Exception as e:
+                    print(f"Could not select tree item: {e}")
+            else:
+                self.status_label.setText(f"Could not find element for XPath: {xpath}")
+                
+        except Exception as e:
+            self.status_label.setText(f"Error navigating to XPath: {str(e)}")
+            print(f"Error in navigate_xpath_link: {e}")
+
     def set_numbered_bookmark(self, digit: int):
         """Set a numbered bookmark (1..9) to current line"""
         try:
@@ -6633,12 +9507,12 @@ Total size: {stats.total_size} bytes"""
         try:
             # Enter loading mode to prevent redundant content-change handling
             self._loading_file = True
-            print(f"DEBUG: Loading file from path: {file_path}")
-            print(f"DEBUG: File exists: {os.path.exists(file_path)}")
+            self._debug_print(f"DEBUG: Loading file from path: {file_path}")
+            self._debug_print(f"DEBUG: File exists: {os.path.exists(file_path)}")
             
             # Check file size first
             file_size = os.path.getsize(file_path)
-            print(f"DEBUG: File size: {file_size} bytes")
+            self._debug_print(f"DEBUG: File size: {file_size} bytes")
             
             # Try to load from cache for faster startup
             cache_loaded = False
@@ -6654,12 +9528,22 @@ Total size: {stats.total_size} bytes"""
                     # Read large files in chunks to avoid memory issues
                     content = self._read_large_file(file_path)
                 else:
-                    # Read small files normally
-                    with open(file_path, 'r', encoding='utf-8') as file:
-                        content = file.read()
+                    # Read small files normally with encoding fallback
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as file:
+                            content = file.read()
+                    except UnicodeDecodeError:
+                        # Try with different encoding if UTF-8 fails (common for Cyrillic files)
+                        try:
+                            with open(file_path, 'r', encoding='cp1251') as file:
+                                content = file.read()
+                        except Exception:
+                            # Last resort: try with latin-1 which accepts all bytes
+                            with open(file_path, 'r', encoding='latin-1') as file:
+                                content = file.read()
                 
-                print(f"DEBUG: Content length: {len(content) if content else 0} characters")
-                print(f"DEBUG: First 100 chars: {content[:100] if content else 'None'}")
+                self._debug_print(f"DEBUG: Content length: {len(content) if content else 0} characters")
+                self._debug_print(f"DEBUG: First 100 chars: {content[:100] if content else 'None'}")
                 
                 self.xml_editor.set_content(content)
                 
@@ -6667,14 +9551,19 @@ Total size: {stats.total_size} bytes"""
                 lines_count = len(content.split('\n')) if content else 0
                 file_size_mb = (file_size / (1024 * 1024)) if file_size else 0
                 
-                if file_size_mb > 2.0:  # For files > 2MB, defer tree building
+                if file_size_mb > 1.0:  # For files > 1MB, defer tree building
                     self.status_label.setText(f"File loaded. Building tree in background...")
                     QApplication.processEvents()
                     # Use QTimer to defer tree building, allowing UI to be responsive
                     QTimer.singleShot(100, lambda: self._deferred_tree_build(content, file_path, file_size))
                 else:
-                    self.xml_tree.populate_tree(content)
-                    self._finalize_file_load(file_path, file_size, content)
+                    try:
+                        self.xml_tree.populate_tree(content)
+                        self._finalize_file_load(file_path, file_size, content)
+                    except Exception as tree_error:
+                        self._debug_print(f"DEBUG: Tree population failed: {str(tree_error)}")
+                        self.status_label.setText(f"Opened: {file_path} (tree build failed - XML may be malformed)")
+                        self._finalize_file_load(file_path, file_size, content)
                 
                 # Save to cache for next startup
                 if use_cache:
@@ -6684,7 +9573,7 @@ Total size: {stats.total_size} bytes"""
             self._loading_file = False
             
         except Exception as e:
-            print(f"DEBUG: Error loading file: {str(e)}")
+            self._debug_print(f"DEBUG: Error loading file: {str(e)}")
             QMessageBox.critical(self, "Error", f"Failed to open file: {str(e)}")
             self.status_label.setText("Ready")
             # Ensure we exit loading mode even on failure
@@ -6696,8 +9585,41 @@ Total size: {stats.total_size} bytes"""
             self.xml_tree.populate_tree(content)
             self._finalize_file_load(file_path, file_size, content)
         except Exception as e:
-            print(f"DEBUG: Error in deferred tree build: {str(e)}")
+            self._debug_print(f"DEBUG: Error in deferred tree build: {str(e)}")
             self.status_label.setText(f"Opened: {file_path} (tree build failed)")
+    
+    def _deferred_tree_build_from_open(self, content: str, file_path: str, file_size: int):
+        """Build tree in a deferred manner for large files opened via open_file"""
+        try:
+            self.xml_tree.populate_tree(content, show_progress=True)
+            self._finalize_file_load(file_path, file_size, content)
+            self._finalize_open_file(file_path)
+        except Exception as e:
+            self._debug_print(f"DEBUG: Error in deferred tree build: {str(e)}")
+            self.status_label.setText(f"Opened: {file_path} (tree build failed)")
+            self._finalize_open_file(file_path)
+    
+    def _finalize_open_file(self, file_path: str):
+        """Finalize file opening after tree is built"""
+        self.current_file = file_path
+        if hasattr(self, 'xml_editor') and self.xml_editor:
+            self.xml_editor.file_path = file_path
+            
+            # Update tab title if we are in a tabbed environment
+            if hasattr(self, 'tab_widget') and self.tab_widget:
+                idx = self.tab_widget.indexOf(self.xml_editor)
+                if idx >= 0:
+                    self.tab_widget.setTabText(idx, os.path.basename(file_path))
+                    self.tab_widget.setTabToolTip(idx, file_path)
+        
+        self._update_window_title()
+        self.status_label.setText(f"Opened: {file_path}")
+        
+        # Update encoding label
+        self.encoding_label.setText("UTF-8")
+        
+        # Add to recent files
+        self._add_to_recent_files(file_path)
     
     def _finalize_file_load(self, file_path: str, file_size: int, content: str):
         """Finalize file loading after tree is built"""
@@ -6711,12 +9633,12 @@ Total size: {stats.total_size} bytes"""
         self.path_line_index = {}
         if self.sync_index_enabled:
             self._build_path_line_index(content)
-            print(f"DEBUG: Index enabled={self.sync_index_enabled}, available={self._sync_index_available}, entries={len(self.path_line_index)}")
+            self._debug_print(f"DEBUG: Index enabled={self.sync_index_enabled}, available={self._sync_index_available}, entries={len(self.path_line_index)}")
         else:
-            print(f"DEBUG: Index/cache disabled for small file (lines={lines_count}, size={file_size_mb:.2f}MB)")
+            self._debug_print(f"DEBUG: Index/cache disabled for small file (lines={lines_count}, size={file_size_mb:.2f}MB)")
         
         self.current_file = file_path
-        self.setWindowTitle(f"Lotus Xml Editor - {os.path.basename(file_path)}")
+        self._update_window_title()
         self.status_label.setText(f"Opened: {file_path}")
         
         # Update encoding label
@@ -6745,26 +9667,41 @@ Total size: {stats.total_size} bytes"""
                 # Check if cache is recent (within 24 hours)
                 cache_age = os.path.getmtime(cache_file)
                 if (os.path.getmtime(file_path) <= cache_age):
-                    print(f"DEBUG: Loading from cache: {cache_file}")
+                    self._debug_print(f"DEBUG: Loading from cache: {cache_file}")
                     with open(cache_file, 'rb') as f:
                         cached_data = pickle.load(f)
                     
                     # Load cached content
                     content = cached_data.get('content', '')
+                    
+                    # Validate content: if file has size but content is empty, cache is invalid
+                    if not content and file_size > 0:
+                        self._debug_print("DEBUG: Cached content is empty but file is not! Invalidating cache.")
+                        return False
+                    
                     self.xml_editor.set_content(content)
+                    
+                    # Verify content was set
+                    current_content = self.xml_editor.get_content()
+                    self._debug_print(f"DEBUG: Editor content length after set: {len(current_content)}")
                     
                     # Note: We still need to rebuild the tree as it contains Qt objects
                     # that can't be pickled, but having the content cached speeds things up
-                    self.xml_tree.populate_tree(content)
-                    self._finalize_file_load(file_path, file_size, content)
+                    try:
+                        self.xml_tree.populate_tree(content)
+                        self._finalize_file_load(file_path, file_size, content)
+                    except Exception as tree_error:
+                        self._debug_print(f"DEBUG: Tree population failed from cache: {str(tree_error)}")
+                        self.status_label.setText(f"Opened: {file_path} (tree build failed - XML may be malformed)")
+                        self._finalize_file_load(file_path, file_size, content)
                     
                     self.status_label.setText(f"Loaded from cache: {os.path.basename(file_path)}")
-                    print(f"DEBUG: Successfully loaded from cache")
+                    self._debug_print(f"DEBUG: Successfully loaded from cache")
                     return True
             
             return False
         except Exception as e:
-            print(f"DEBUG: Cache load failed: {str(e)}")
+            self._debug_print(f"DEBUG: Cache load failed: {str(e)}")
             return False
     
     def _save_to_cache(self, file_path: str, content: str, file_size: int):
@@ -6775,6 +9712,11 @@ Total size: {stats.total_size} bytes"""
             
             # Don't cache very large files (> 10MB)
             if file_size > 10 * 1024 * 1024:
+                return
+            
+            # Don't cache empty content if file size indicates otherwise
+            if not content and file_size > 0:
+                self._debug_print("DEBUG: Skipping cache save for empty content")
                 return
             
             # Create cache directory
@@ -6797,13 +9739,13 @@ Total size: {stats.total_size} bytes"""
             with open(cache_file, 'wb') as f:
                 pickle.dump(cached_data, f)
             
-            print(f"DEBUG: Saved to cache: {cache_file}")
+            self._debug_print(f"DEBUG: Saved to cache: {cache_file}")
             
             # Clean up old cache files (keep only last 10)
             self._cleanup_old_cache(cache_dir)
             
         except Exception as e:
-            print(f"DEBUG: Cache save failed: {str(e)}")
+            self._debug_print(f"DEBUG: Cache save failed: {str(e)}")
     
     def _cleanup_old_cache(self, cache_dir: str):
         """Clean up old cache files, keeping only the most recent ones"""
@@ -6821,11 +9763,11 @@ Total size: {stats.total_size} bytes"""
             for _, filepath in cache_files[10:]:
                 try:
                     os.remove(filepath)
-                    print(f"DEBUG: Removed old cache file: {filepath}")
+                    self._debug_print(f"DEBUG: Removed old cache file: {filepath}")
                 except Exception:
                     pass
         except Exception as e:
-            print(f"DEBUG: Cache cleanup failed: {str(e)}")
+            self._debug_print(f"DEBUG: Cache cleanup failed: {str(e)}")
     
     def show_split_dialog(self):
         """Show XML split configuration dialog"""
@@ -7100,8 +10042,8 @@ Total size: {stats.total_size} bytes"""
                 
                 # Update window title and status
                 self.current_file = None  # Mark as unsaved
-                self.setWindowTitle(f"Lotus Xml Editor - Reconstructed from {os.path.basename(directory)}")
-                self.status_label.setText("XML reconstructed successfully")
+                self._update_window_title()
+                self.status_label.setText(f"XML reconstructed from {os.path.basename(directory)}")
                 
                 self.bottom_panel.append_output(f"XML reconstructed from split project: {directory}")
                 
@@ -7254,6 +10196,172 @@ Total size: {stats.total_size} bytes"""
             QMessageBox.critical(self, "Error", f"Failed to combine files: {str(e)}")
 
 
+    def _encode_file_to_clipboard(self):
+        """
+        Win-Ctrl-Ins: Put entire zip file (or file in clipboard) into clipboard as base ansi text.
+        Prefix: '''filename<CR><LF>
+        """
+        clipboard = QApplication.clipboard()
+        mime_data = clipboard.mimeData()
+        
+        file_path = None
+        
+        # Check for file URLs (standard)
+        if mime_data.hasUrls():
+            urls = mime_data.urls()
+            if urls:
+                file_path = urls[0].toLocalFile()
+        
+        # If no file in clipboard, check if we currently have a file open? 
+        if not file_path:
+             return
+            
+        if file_path and os.path.exists(file_path):
+            try:
+                # Read file content
+                with open(file_path, 'rb') as f:
+                    file_content = f.read()
+                
+                # Encode to base64
+                encoded_content = base64.b64encode(file_content).decode('ascii')
+                
+                filename = os.path.basename(file_path)
+                
+                # Format: '''filename\r\n<content>
+                final_text = f"'''{filename}\r\n{encoded_content}"
+                
+                clipboard.setText(final_text)
+                if hasattr(self, 'status_label') and self.status_label:
+                    self.status_label.setText(f"Encoded {filename} to clipboard as text")
+                
+            except Exception as e:
+                QMessageBox.warning(self, "Encoding Error", f"Failed to encode file: {str(e)}")
+
+    def _decode_file_from_clipboard(self):
+        """
+        Win-Shift-Ins: Receive ansi text from clipboard, check prefix, save to file.
+        Prefix: '''filename<CR><LF>
+        """
+        clipboard = QApplication.clipboard()
+        text = clipboard.text()
+        
+        if not text.startswith("'''"):
+            return # Not our format
+            
+        try:
+            # Parse filename
+            # Format: '''filename\r\n
+            # Find first \r\n or \n
+            newline_pos = text.find('\n')
+            if newline_pos == -1:
+                return
+                
+            first_line = text[:newline_pos].strip()
+            # Remove leading '''
+            if not first_line.startswith("'''"):
+                return
+            
+            filename = first_line[3:].strip()
+            if not filename:
+                return
+                
+            # Content is after the first line (and potential \r)
+            content_start = newline_pos + 1
+            encoded_content = text[content_start:].strip()
+            
+            # Decode base64
+            file_content = base64.b64decode(encoded_content)
+            
+            # Determine target directory
+            # "temp dir (or dir opened in file tree, if active)"
+            target_dir = tempfile.gettempdir()
+            
+            if self.current_file:
+                target_dir = os.path.dirname(self.current_file)
+            elif hasattr(self, 'file_navigator') and self.file_navigator.isVisible():
+                 # Try to get path from file navigator
+                 try:
+                     index = self.file_navigator.tree.currentIndex()
+                     if index.isValid():
+                         path = self.file_navigator.model.filePath(index)
+                         if os.path.isdir(path):
+                             target_dir = path
+                         else:
+                             target_dir = os.path.dirname(path)
+                     else:
+                         target_dir = self.file_navigator.model.rootPath()
+                 except Exception:
+                     pass
+            
+            target_path = os.path.join(target_dir, filename)
+            
+            # Write file
+            with open(target_path, 'wb') as f:
+                f.write(file_content)
+                
+            # Put binary file into clipboard as a file
+            data = QMimeData()
+            url = QUrl.fromLocalFile(target_path)
+            data.setUrls([url])
+            clipboard.setMimeData(data)
+            
+            if hasattr(self, 'status_label') and self.status_label:
+                self.status_label.setText(f"Decoded {filename} to {target_path} and put in clipboard")
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Decoding Error", f"Failed to decode file: {str(e)}")
+
+    def _apply_text_transform(self, transform_func):
+        """Apply a text transformation function to the selected text."""
+        cursor = self.xml_editor.textCursor()
+        if not cursor.hasSelection():
+             QMessageBox.information(self, "No Selection", "Please select text to transform.")
+             return
+             
+        selected_text = cursor.selectedText()
+        # Handle paragraph separator from PyQt6
+        raw_text = selected_text.replace('\u2029', '\n')
+        new_text = transform_func(raw_text)
+        
+        cursor.beginEditBlock()
+        cursor.insertText(new_text)
+        cursor.endEditBlock()
+        
+    def escape_selection_entities(self):
+        """Convert special characters in selection to XML entities."""
+        def escape_logic(text):
+            # 1. Safe & escape (preserve existing entities)
+            text = re.sub(r'&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)', '&amp;', text)
+            # 2. Others
+            text = text.replace('<', '&lt;')
+            text = text.replace('>', '&gt;')
+            text = text.replace('"', '&quot;')
+            text = text.replace("'", '&apos;')
+            text = text.replace('\u00A0', '&#160;')
+            return text
+            
+        self._apply_text_transform(escape_logic)
+        if hasattr(self, 'status_label'):
+            self.status_label.setText("Escaped XML entities in selection")
+
+    def unescape_selection_entities(self):
+        """Convert XML entities in selection back to characters."""
+        def unescape_logic(text):
+            text = text.replace('&lt;', '<')
+            text = text.replace('&gt;', '>')
+            text = text.replace('&quot;', '"')
+            text = text.replace('&apos;', "'")
+            text = text.replace('&#160;', '\u00A0')
+            text = text.replace('&#xA0;', '\u00A0')
+            text = text.replace('&amp;', '&')
+            return text
+            
+        self._apply_text_transform(unescape_logic)
+        if hasattr(self, 'status_label'):
+            self.status_label.setText("Unescaped XML entities in selection")
+
+
+
 def main():
     """Main function"""
     app = QApplication(sys.argv)
@@ -7262,6 +10370,20 @@ def main():
     
     # Set application style
     app.setStyle("Fusion")
+    
+    # Set application icon for taskbar (Windows)
+    icon_path = os.path.join(os.path.dirname(__file__), "blotus.ico")
+    if os.path.exists(icon_path):
+        app_icon = QIcon(icon_path)
+        app.setWindowIcon(app_icon)
+        
+        # Windows-specific: Set app user model ID for taskbar icon
+        try:
+            import ctypes
+            myappid = 'com.lotusxmleditor.app.1.0'
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception:
+            pass
     
     # Handle command line arguments
     file_path = None
@@ -7272,6 +10394,11 @@ def main():
             file_path = os.path.abspath(file_path)
     
     window = MainWindow(file_path)
+    
+    # Also set icon on the main window
+    if os.path.exists(icon_path):
+        window.setWindowIcon(app_icon)
+    
     window.show()
     
     sys.exit(app.exec())
