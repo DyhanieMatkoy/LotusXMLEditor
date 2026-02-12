@@ -1,0 +1,20 @@
+<?xml version="1.0" ?>
+<root>
+  <child1>Value1
+Value2
+123
+</child1>
+  <child2>
+    <name>Ирина
+      </name>
+  </child2>
+  <child3>
+    Value 2
+    <child4>
+      <name>П3
+      </name>     
+      <name2>Полина
+      </name2>
+    </child4>
+  </child3>
+</root>

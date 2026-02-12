@@ -8,11 +8,12 @@ import os
 import xml.etree.ElementTree as ET
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
-    QPushButton, QLabel, QLineEdit, QTextEdit, QGroupBox, QCheckBox,
+    QPushButton, QLabel, QLineEdit, QGroupBox, QCheckBox,
     QFileDialog, QMessageBox, QProgressBar, QComboBox, QSpinBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QColor
+from PyQt6.Qsci import QsciScintilla, QsciLexerXML
 
 
 class CombineWorkerThread(QThread):
@@ -378,10 +379,24 @@ class CombineDialog(QDialog):
         
         layout = QVBoxLayout()
         
-        preview_text = QTextEdit()
-        preview_text.setPlainText(self.combined_content)
+        preview_text = QsciScintilla()
+        preview_text.setUtf8(True)
+        preview_text.setText(self.combined_content)
         preview_text.setReadOnly(True)
-        preview_text.setFont(QFont("Consolas", 10))
+        
+        # Configure lexer for XML highlighting
+        lexer = QsciLexerXML()
+        lexer.setDefaultFont(QFont("Consolas", 10))
+        preview_text.setLexer(lexer)
+        
+        # Simple dark theme adjustments if needed (assuming standard theme for now)
+        # But let's stick to defaults or match the dialog style if it's dark
+        # The dialog has no specific dark theme applied in the init, 
+        # so we assume default or system theme. 
+        # However, split_dialog had dark theme. 
+        # Let's check if main window applies theme globally.
+        # For now, basic highlighting is a win.
+        
         layout.addWidget(preview_text)
         
         close_btn = QPushButton("Close")

@@ -1,0 +1,59 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    CODE FOLDING DEMONSTRATION                                ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+BEFORE FOLDING:
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Line │ Code                                                                  │
+├──────┼───────────────────────────────────────────────────────────────────────┤
+│  1   │ <?xml version="1.0"?>                                                 │
+│  2   │ <root>                                                                │
+│  3 ▼ │     <element1>                          ← Hover shows fold control   │
+│  4   │         <child1>Value 1</child1>                                      │
+│  5   │         <child2>Value 2</child2>                                      │
+│  6   │     </element1>                                                       │
+│  7   │     <element2>                                                        │
+│  8   │         <child3>Value 3</child3>                                      │
+│  9   │     </element2>                                                       │
+│ 10   │ </root>                                                               │
+└──────┴───────────────────────────────────────────────────────────────────────┘
+
+AFTER FOLDING (click on ▼ or press Ctrl+Shift+[):
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Line │ Code                                                                  │
+├──────┼───────────────────────────────────────────────────────────────────────┤
+│  1   │ <?xml version="1.0"?>                                                 │
+│  2   │ <root>                                                                │
+│  3 ► │     <element1>                          ← Click to unfold            │
+│      │     ... (lines 4-5 hidden)                                            │
+│  6   │     </element1>                                                       │
+│  7   │     <element2>                                                        │
+│  8   │         <child3>Value 3</child3>                                      │
+│  9   │     </element2>                                                       │
+│ 10   │ </root>                                                               │
+└──────┴───────────────────────────────────────────────────────────────────────┘
+
+VISUAL INDICATORS:
+  ▼  = Unfoldable element (appears on hover)
+  ►  = Folded element (click to expand)
+
+KEYBOARD SHORTCUTS:
+  Ctrl+Shift+[  = Fold current element under cursor
+  Ctrl+Shift+]  = Unfold current element under cursor
+  Ctrl+Shift+U  = Unfold all folded elements
+
+HOW TO USE:
+1. Enable line numbers: Ctrl+L or View → Show Line Numbers
+2. Hover mouse over line number with XML element
+3. Click on triangle to fold/unfold
+4. Or use keyboard shortcuts
+
+MENU ACCESS:
+View → Fold Current Element
+View → Unfold Current Element
+View → Unfold All
+
+NOTES:
+- Folding works only for well-formed XML elements
+- Editing text auto-unfolds all blocks
+- Fold state is not saved (resets on file reload)

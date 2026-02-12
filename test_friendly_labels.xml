@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root>
+    <Item>
+        <Name>Friendly Name 1</Name>
+        <Description>Standard Case</Description>
+    </Item>
+    <Item>
+        <name>Friendly Name 2</name>
+        <Description>Lowercase name</Description>
+    </Item>
+    <Item>
+        <NAME>Friendly Name 3</NAME>
+        <Description>Uppercase NAME</Description>
+    </Item>
+    <Item>
+        <Имя>Friendly Name 4</Имя>
+        <Description>Cyrillic Name</Description>
+    </Item>
+    <Item>
+        <имя>Friendly Name 5</имя>
+        <Description>Cyrillic lowercase</Description>
+    </Item>
+</root>

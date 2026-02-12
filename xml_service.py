@@ -6,6 +6,10 @@ import xml.etree.ElementTree as ET
 import xml.dom.minidom
 from typing import List, Optional, Dict, Any
 import re
+import os
+import pickle
+import hashlib
+import tempfile
 from models import XmlTreeNode, XmlValidationResult, XmlValidationError, XmlStatistics
 from xml_splitter import XmlSplitter, XmlSplitConfig, XmlSplitRule
 from xml_part_manager import XmlPartManager
@@ -23,7 +27,60 @@ class XmlService:
     
     def __init__(self):
         self.namespaces = {}
-    
+        # Setup cache directory in temp folder
+        self.cache_dir = os.path.join(tempfile.gettempdir(), 'lotus_xml_editor_cache')
+        if not os.path.exists(self.cache_dir):
+            try:
+                os.makedirs(self.cache_dir)
+            except Exception:
+                pass
+
+    def _get_cache_path(self, file_path: str) -> str:
+        """Generate cache file path based on file path hash"""
+        if not file_path:
+            return None
+        # Create a hash of the file path
+        path_hash = hashlib.md5(file_path.encode('utf-8')).hexdigest()
+        return os.path.join(self.cache_dir, f"{path_hash}.pkl")
+
+    def load_tree_cache(self, file_path: str) -> Optional[XmlTreeNode]:
+        """Load tree structure from cache if valid"""
+        try:
+            if not file_path or not os.path.exists(file_path):
+                return None
+                
+            cache_path = self._get_cache_path(file_path)
+            if not cache_path or not os.path.exists(cache_path):
+                return None
+                
+            # Check if cache is stale
+            file_mtime = os.path.getmtime(file_path)
+            cache_mtime = os.path.getmtime(cache_path)
+            
+            if file_mtime > cache_mtime:
+                return None
+                
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"Error loading cache: {e}")
+            return None
+
+    def save_tree_cache(self, file_path: str, root_node: XmlTreeNode):
+        """Save tree structure to cache"""
+        try:
+            if not file_path:
+                return
+                
+            cache_path = self._get_cache_path(file_path)
+            if not cache_path:
+                return
+                
+            with open(cache_path, 'wb') as f:
+                pickle.dump(root_node, f)
+        except Exception as e:
+            print(f"Error saving cache: {e}")
+
     def parse_xml(self, xml_content: str) -> Optional[ET.Element]:
         """Parse XML content and return root element"""
         try:
@@ -35,7 +92,14 @@ class XmlService:
             if LXML_AVAILABLE:
                 try:
                     # lxml is much faster for large files
-                    root = lxml_etree.fromstring(xml_content.encode('utf-8'))
+                    # Try to encode properly, handling different encodings
+                    try:
+                        xml_bytes = xml_content.encode('utf-8')
+                    except UnicodeEncodeError:
+                        # If UTF-8 encoding fails, the string might already be in a different encoding
+                        xml_bytes = xml_content.encode('latin-1')
+                    
+                    root = lxml_etree.fromstring(xml_bytes)
                     # Convert lxml element to ElementTree for compatibility
                     return ET.fromstring(lxml_etree.tostring(root))
                 except Exception as lxml_error:
@@ -44,12 +108,27 @@ class XmlService:
             
             # Use incremental parsing for large files
             if len(xml_content) > 1024 * 1024:  # 1MB threshold
-                parser = ET.XMLParser(target=ET.TreeBuilder(), encoding='utf-8')
-                parser.feed(xml_content.encode('utf-8'))
+                parser = ET.XMLParser(target=ET.TreeBuilder())
+                # Try to parse as string first, then try encoding
+                try:
+                    parser.feed(xml_content)
+                except TypeError:
+                    # If string doesn't work, try encoding
+                    try:
+                        parser.feed(xml_content.encode('utf-8'))
+                    except UnicodeEncodeError:
+                        parser.feed(xml_content.encode('latin-1'))
                 root = parser.close()
             else:
                 # Parse XML normally for smaller files
-                root = ET.fromstring(xml_content)
+                try:
+                    root = ET.fromstring(xml_content)
+                except TypeError:
+                    # Try encoding if string parsing fails
+                    try:
+                        root = ET.fromstring(xml_content.encode('utf-8'))
+                    except UnicodeEncodeError:
+                        root = ET.fromstring(xml_content.encode('latin-1'))
             
             return root
         except ET.ParseError as e:
@@ -213,9 +292,44 @@ class XmlService:
             if not declaration_match:
                 errors.append("Invalid XML declaration format")
     
-    def build_xml_tree(self, xml_content: str) -> Optional[XmlTreeNode]:
+    def build_xml_tree(self, xml_content: str, file_path: Optional[str] = None) -> Optional[XmlTreeNode]:
         """Build tree structure from XML content"""
         try:
+            # Quick Win: Use lxml directly if available for O(1) line numbers and faster parsing
+            if LXML_AVAILABLE:
+                try:
+                    # Priority: Parse directly from file if available (handles encoding automatically)
+                    if file_path:
+                        try:
+                            parser = lxml_etree.XMLParser(recover=True)
+                            tree = lxml_etree.parse(file_path, parser=parser)
+                            root = tree.getroot()
+                            if root is not None:
+                                return self._lxml_element_to_tree_node(root)
+                        except Exception as file_parse_error:
+                            print(f"lxml file parse failed, falling back to content: {file_parse_error}")
+
+                    # Fallback/Default: Parse from string content
+                    # Strip BOM if present
+                    if xml_content.startswith('\ufeff'):
+                        xml_content = xml_content[1:]
+                        
+                    try:
+                        xml_bytes = xml_content.encode('utf-8')
+                    except UnicodeEncodeError:
+                        xml_bytes = xml_content.encode('latin-1')
+                    
+                    parser = lxml_etree.XMLParser(recover=True)
+                    root = lxml_etree.fromstring(xml_bytes, parser=parser)
+                    
+                    if root is None:
+                        return None
+                        
+                    return self._lxml_element_to_tree_node(root)
+                except Exception as lxml_error:
+                    print(f"lxml tree build failed, falling back to ElementTree: {lxml_error}")
+            
+            # Fallback to standard ElementTree
             root = self.parse_xml(xml_content)
             if root is None:
                 return None
@@ -226,72 +340,82 @@ class XmlService:
         except Exception as e:
             print(f"Error building XML tree: {e}")
             return None
-    
+
+    def _lxml_element_to_tree_node(self, element, parent_path: str = "", index: int = 1) -> XmlTreeNode:
+        """Convert lxml element to tree node using native sourceline"""
+        # Determine tag name (handling namespaces)
+        tag = element.tag
+        if isinstance(tag, str) and tag.startswith("{"):
+            tag = tag.split('}', 1)[1]
+            
+        current_path = f"{parent_path}/{tag}[{index}]" if parent_path else f"/{tag}[{index}]"
+
+        text = element.text.strip() if element.text and element.text.strip() else ""
+        
+        # Process attributes
+        attributes = {}
+        if element.attrib:
+            for k, v in element.attrib.items():
+                # Handle namespaced attributes
+                attr_name = k
+                if isinstance(k, str) and k.startswith("{"):
+                    attr_name = k.split('}', 1)[1]
+                attributes[attr_name] = v
+                
+        attr_string = " ".join([f"{k}=\"{v}\"" for k, v in attributes.items()])
+        display_name = tag if not attr_string else f"{tag} [{attr_string}]"
+
+        # lxml provides line number directly
+        line_number = getattr(element, 'sourceline', 0) or 0
+
+        node = XmlTreeNode(
+            name=display_name,
+            tag=tag,
+            value=text,
+            attributes=attributes,
+            path=current_path,
+            line_number=line_number
+        )
+
+        tag_counts: Dict[str, int] = {}
+        for child in element:
+            # Get tag name for child (handling namespaces)
+            child_tag = child.tag
+            if isinstance(child_tag, str) and child_tag.startswith("{"):
+                child_tag = child_tag.split('}', 1)[1]
+                
+            cnt = tag_counts.get(child_tag, 0) + 1
+            tag_counts[child_tag] = cnt
+            
+            # Recursively build children
+            child_node = self._lxml_element_to_tree_node(child, current_path, cnt)
+            try:
+                child_node.parent_node = node
+            except Exception:
+                pass
+            node.children.append(child_node)
+
+        return node
+
     def _build_tree_with_line_numbers(self, xml_content: str, root: ET.Element) -> XmlTreeNode:
-        """Build tree with line numbers from XML content"""
+        """Build tree with line numbers from XML content (Legacy/Fallback)"""
         lines = xml_content.split('\n')
         # Quick Win #3: Pre-compute line index for 50-70% faster line number lookups
         line_index = self._build_line_index(lines)
-        return self._element_to_tree_node_with_lines(root, lines, "", 0, None, line_index)
-    
-    def _build_line_index(self, lines: List[str]) -> Dict[str, List[int]]:
-        """Build an index mapping tag names to line numbers for fast lookup"""
-        line_index = {}
-        for i, line in enumerate(lines):
-            # Find all opening tags on this line
-            matches = re.finditer(r'<([a-zA-Z_][a-zA-Z0-9_:-]*)', line)
-            for match in matches:
-                tag = match.group(1)
-                if tag not in line_index:
-                    line_index[tag] = []
-                line_index[tag].append(i)
-        return line_index
-    
-    def _element_to_tree_node_with_lines(self, element: ET.Element, lines: List[str], parent_path: str = "", start_line: int = 0, parent_element: Optional[ET.Element] = None, line_index: Optional[Dict[str, List[int]]] = None) -> XmlTreeNode:
-        """Convert XML element to tree node with line numbers, including index-aware paths"""
-        # Determine sibling index for this element (1-based)
-        if parent_element is not None:
-            siblings_before = 0
-            for sibling in parent_element:
-                if sibling is element:
-                    break
-                if sibling.tag == element.tag:
-                    siblings_before += 1
-            index = siblings_before + 1
-        else:
-            # Root element index is 1
-            index = 1
-        
-        # Build index-aware path with leading '/'
-        if parent_path:
-            current_path = f"{parent_path}/{element.tag}[{index}]"
-        else:
-            current_path = f"/{element.tag}[{index}]"
-        
-        # Get text content (if any)
+        return self._element_to_tree_node_with_lines(root, lines, "", 0, 1, line_index)
+
+    def _element_to_shallow_node_with_lines(self, element: ET.Element, lines: List[str], parent_path: str = "", start_line: int = 0, index: int = 1, line_index: Optional[Dict[str, List[int]]] = None) -> XmlTreeNode:
+        current_path = f"{parent_path}/{element.tag}[{index}]" if parent_path else f"/{element.tag}[{index}]"
         text = element.text.strip() if element.text and element.text.strip() else ""
-        
-        # Get attributes as string
-        attrs = []
-        for key, value in element.attrib.items():
-            attrs.append(f'{key}="{value}"')
-        attr_string = " ".join(attrs)
-        
-        # Create display name
-        display_name = element.tag
-        if attr_string:
-            display_name += f" [{attr_string}]"
-        
-        # Find line number for this element using index if available
-        if line_index and element.tag in line_index:
-            # Use pre-computed index for faster lookup
+        attr_string = " ".join([f"{k}=\"{v}\"" for k, v in element.attrib.items()])
+        display_name = element.tag if not attr_string else f"{element.tag} [{attr_string}]"
+        if line_index is None:
+            line_number = 0
+        elif element.tag in line_index:
             tag_lines = line_index[element.tag]
             line_number = next((line + 1 for line in tag_lines if line >= start_line), 0)
         else:
-            # Fallback to sequential search
             line_number = self._find_element_line_number(lines, element.tag, start_line)
-        
-        # Create node
         node = XmlTreeNode(
             name=display_name,
             tag=element.tag,
@@ -300,21 +424,6 @@ class XmlService:
             path=current_path,
             line_number=line_number
         )
-        
-        # Add child nodes
-        current_line = line_number if line_number > 0 else start_line
-        for child in element:
-            child_node = self._element_to_tree_node_with_lines(child, lines, current_path, current_line, element, line_index)
-            # Set back-reference to parent for breadcrumb generation
-            try:
-                child_node.parent_node = node
-            except Exception:
-                pass
-            node.children.append(child_node)
-            # Update current line for next sibling
-            if child_node.line_number > current_line:
-                current_line = child_node.line_number
-        
         return node
     
     def _find_element_line_number(self, lines: List[str], tag_name: str, start_line: int = 0) -> int:
@@ -326,59 +435,34 @@ class XmlService:
                 return i + 1  # Convert to 1-based line number
         return 0  # Not found
     
-    def _element_to_tree_node(self, element: ET.Element, parent_path: str = "", parent_element: Optional[ET.Element] = None) -> XmlTreeNode:
+    def _element_to_tree_node(self, element: ET.Element, parent_path: str = "", index: int = 1) -> XmlTreeNode:
         """Convert XML element to tree node (legacy method) with index-aware paths"""
-        # Determine sibling index
-        if parent_element is not None:
-            siblings_before = 0
-            for sibling in parent_element:
-                if sibling is element:
-                    break
-                if sibling.tag == element.tag:
-                    siblings_before += 1
-            index = siblings_before + 1
-        else:
-            index = 1
-        
-        # Build path with index and leading '/'
-        if parent_path:
-            current_path = f"{parent_path}/{element.tag}[{index}]"
-        else:
-            current_path = f"/{element.tag}[{index}]"
-        
-        # Get text content (if any)
+        current_path = f"{parent_path}/{element.tag}[{index}]" if parent_path else f"/{element.tag}[{index}]"
+
         text = element.text.strip() if element.text and element.text.strip() else ""
-        
-        # Get attributes as string
-        attrs = []
-        for key, value in element.attrib.items():
-            attrs.append(f'{key}="{value}"')
-        attr_string = " ".join(attrs)
-        
-        # Create display name
-        display_name = element.tag
-        if attr_string:
-            display_name += f" [{attr_string}]"
-        
-        # Create node
+        attr_string = " ".join([f"{k}=\"{v}\"" for k, v in element.attrib.items()])
+        display_name = element.tag if not attr_string else f"{element.tag} [{attr_string}]"
+
         node = XmlTreeNode(
             name=display_name,
             tag=element.tag,
             value=text,
             attributes=dict(element.attrib),
             path=current_path,
-            line_number=0  # No line number in legacy
+            line_number=0
         )
-        
-        # Add child nodes
+
+        tag_counts: Dict[str, int] = {}
         for child in element:
-            child_node = self._element_to_tree_node(child, current_path, element)
+            cnt = tag_counts.get(child.tag, 0) + 1
+            tag_counts[child.tag] = cnt
+            child_node = self._element_to_tree_node(child, current_path, cnt)
             try:
                 child_node.parent_node = node
             except Exception:
                 pass
             node.children.append(child_node)
-        
+
         return node
     
     def get_element_line_number(self, xml_content: str, element_path: str) -> int:

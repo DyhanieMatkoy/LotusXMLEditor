@@ -1,5 +1,17 @@
 # Release Notes
 
+## Version 2026-02-04
+
+### Features
+- **Toggle Comment (Ctrl+/)**:
+  - Added support for toggling comments in both the Main Editor and Fragment Editor.
+  - Smart syntax detection: uses `//` for 1C-Ent style and `<!-- -->` for XML.
+- **Remove Empty Lines**:
+  - Added command to remove empty or whitespace-only lines from the selected text.
+  - Available in Edit menu and Context menu for both editors.
+- **Context Menu Enhancements**:
+  - Added "Toggle Comment" and "Remove Empty Lines" to right-click menus in both editors.
+
 ## Unreleased
 
 Date: 2025-10-03

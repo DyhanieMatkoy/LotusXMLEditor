@@ -3,7 +3,7 @@ Data models for XML editor
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime
 import os
 
@@ -381,3 +381,58 @@ class ThemeChangedEventArgs:
     def __str__(self):
         """String representation"""
         return f"Theme changed from '{self.old_theme}' to '{self.new_theme}'"
+
+
+@dataclass
+class MetroGraphNode:
+    """Extended node model for metro graph visualization"""
+    xml_node: XmlTreeNode
+    level: int  # 0, 1, or 2 (for 3 levels)
+    position: Tuple[float, float] = (0.0, 0.0)  # (x, y) coordinates
+    children: List['MetroGraphNode'] = field(default_factory=list)
+    parent: Optional['MetroGraphNode'] = None
+    is_selected: bool = False
+    is_highlighted: bool = False
+    
+    @property
+    def xpath(self) -> str:
+        """Get XPath of this node"""
+        return self.xml_node.path
+        
+    @property
+    def display_name(self) -> str:
+        """Get display name for station"""
+        return self.xml_node.name
+        
+    @property
+    def child_count(self) -> int:
+        """Get number of children"""
+        return len(self.children)
+
+
+@dataclass
+class MetroNavigatorSettings:
+    """Settings for metro navigator"""
+    zoom_level: float = 1.0
+    center_x: float = 0.0
+    center_y: float = 0.0
+    window_geometry: Optional[Dict[str, int]] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization"""
+        return {
+            'zoom_level': self.zoom_level,
+            'center_x': self.center_x,
+            'center_y': self.center_y,
+            'window_geometry': self.window_geometry
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MetroNavigatorSettings':
+        """Create from dictionary"""
+        return cls(
+            zoom_level=data.get('zoom_level', 1.0),
+            center_x=data.get('center_x', 0.0),
+            center_y=data.get('center_y', 0.0),
+            window_geometry=data.get('window_geometry', None)
+        )

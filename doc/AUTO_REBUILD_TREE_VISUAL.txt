@@ -1,0 +1,114 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    AutoRebuildTree Feature - Visual Guide                    ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ SCENARIO 1: Auto Rebuild ENABLED (Default)                                  │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Settings Dialog:
+┌─────────────────────────────────────────────────────────────────┐
+│ Tree Updates                                                    │
+│ ┌─────────────────────────────────────────────────────────────┐ │
+│ │ Auto Rebuild Tree          [✓]  Automatically rebuild tree  │ │
+│ │ Debounce Interval (ms)     5000  Delay before updating tree │ │
+│ └─────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+
+Toolbar:
+┌─────────────────────────────────────────────────────────────────┐
+│ [File Tree] [Rebuild Tree] [Enable Sync] [Hide <> Symbols] ... │
+└─────────────────────────────────────────────────────────────────┘
+                    ↑
+              No indicator shown
+              Tree updates automatically
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ SCENARIO 2: Auto Rebuild DISABLED                                           │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Settings Dialog:
+┌─────────────────────────────────────────────────────────────────┐
+│ Tree Updates                                                    │
+│ ┌─────────────────────────────────────────────────────────────┐ │
+│ │ Auto Rebuild Tree          [ ]  Automatically rebuild tree  │ │
+│ │ Debounce Interval (ms)     5000  Delay before updating tree │ │
+│ └─────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+
+Toolbar (BEFORE text change):
+┌─────────────────────────────────────────────────────────────────┐
+│ [File Tree] [Rebuild Tree] [Enable Sync] [Hide <> Symbols] ... │
+└─────────────────────────────────────────────────────────────────┘
+                    ↑
+              No indicator yet
+
+
+Toolbar (AFTER text change):
+┌─────────────────────────────────────────────────────────────────┐
+│ [File Tree] ⚠ [Rebuild Tree] [Enable Sync] [Hide <> Symbols]...│
+└─────────────────────────────────────────────────────────────────┘
+             ↑
+    Orange indicator appears!
+    Tooltip: "Tree needs rebuild - click 'Rebuild Tree' to update"
+
+
+Toolbar (AFTER clicking Rebuild Tree or pressing F11):
+┌─────────────────────────────────────────────────────────────────┐
+│ [File Tree] [Rebuild Tree] [Enable Sync] [Hide <> Symbols] ... │
+└─────────────────────────────────────────────────────────────────┘
+                    ↑
+         Indicator disappears
+         Tree is now updated
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ WORKFLOW DIAGRAM                                                             │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Auto Rebuild = ON:
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ Text Changed │───▶│ Wait 5 sec   │───▶│ Tree Updated │
+└──────────────┘    └──────────────┘    └──────────────┘
+                         (debounce)
+
+
+Auto Rebuild = OFF:
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ Text Changed │───▶│ Show ⚠       │───▶│ User clicks  │───▶│ Tree Updated │
+│              │    │ Indicator    │    │ Rebuild Tree │    │ Hide ⚠       │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
+                                              (F11)
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ INDICATOR DETAILS                                                            │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Symbol:    ⚠ (Unicode U+26A0 WARNING SIGN)
+Color:     Orange (#FFA500)
+Size:      16px
+Weight:    Bold
+Position:  Left of "Rebuild Tree" button in toolbar
+Tooltip:   "Tree needs rebuild - click 'Rebuild Tree' to update"
+Visibility: Only when auto_rebuild_tree=False AND text was changed
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ KEYBOARD SHORTCUTS                                                           │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+F11  - Rebuild Tree (manual rebuild, hides indicator)
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ USE CASES                                                                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+✓ Large XML files (>1MB)        → Disable auto-rebuild for better performance
+✓ Batch editing                 → Disable, edit multiple times, rebuild once
+✓ Slow computers                → Disable to reduce CPU usage during editing
+✓ Small files (<100KB)          → Keep enabled for immediate visual feedback
+✓ Quick edits                   → Keep enabled for convenience
+

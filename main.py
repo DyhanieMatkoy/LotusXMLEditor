@@ -10,14 +10,15 @@ import random
 import subprocess
 from version import __version__, __build_date__, __app_name__
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QTreeWidget, 
-                             QTreeWidgetItem, QTextEdit, QStatusBar, QMenuBar, 
+                             QTreeWidgetItem, QStatusBar, QMenuBar, 
                              QToolBar, QVBoxLayout, QHBoxLayout, QWidget, 
                              QTabWidget, QListWidget, QListWidgetItem, QPushButton, QLabel, 
                              QFileDialog, QMessageBox, QLineEdit, QCheckBox, QComboBox, QToolButton,
                              QDialog, QDialogButtonBox, QSpinBox, QFrame,
                              QHeaderView, QTreeWidgetItemIterator, QMenu, QDockWidget, QProgressBar, QInputDialog, QStyle)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QDateTime, QSettings, QThread, QByteArray, QMimeData, QUrl
-from PyQt6.QtGui import QAction, QIcon, QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QTextCursor, QPainter, QShortcut, QKeySequence
+from PyQt6.QtGui import QAction, QIcon, QFont, QColor, QPainter, QShortcut, QKeySequence
+from PyQt6.Qsci import QsciScintilla, QsciLexerXML
 import re
 import zipfile
 import json
@@ -27,8 +28,7 @@ import shutil
 
 from xml_service import XmlService
 from models import XmlFileModel, XmlTreeNode, XmlValidationResult
-from highlighter import XmlHighlighter
-from syntax import LanguageDefinition, LanguageRegistry, LanguageProfileCompiler, RuleHighlighter, load_udl_xml
+from syntax import LanguageDefinition, LanguageRegistry, LanguageProfileCompiler, load_udl_xml
 from split_dialog import XmlSplitConfigDialog
 from file_navigator import FileNavigatorWidget
 from combine_dialog import CombineDialog
@@ -47,9 +47,10 @@ from exchange_manager import (
 )
 from splash_screen import LoadingSplashScreen
 from fragment_dialog import FragmentEditorDialog
-from line_number_widget import LineNumberWidget
 from metro_navigator import MetroNavigatorWindow
 from about_dialog import AboutDialog
+from favorites_widget import FavoritesWidget
+from object_form import ObjectNodeForm
 
 
 class XmlTreeWidget(QTreeWidget):
@@ -57,6 +58,7 @@ class XmlTreeWidget(QTreeWidget):
     node_selected = pyqtSignal(object)
     delete_node_requested = pyqtSignal(object)
     hide_node_requested = pyqtSignal(object)
+    tree_built = pyqtSignal()
     
     def __init__(self, status_label=None):
         super().__init__()
@@ -65,6 +67,7 @@ class XmlTreeWidget(QTreeWidget):
         self.use_friendly_labels = True  # default: show friendly labels
         self.setHeaderLabels(["Element", "Value"])
         self.setAlternatingRowColors(True)
+        self.setDragEnabled(True)
         self.itemClicked.connect(self._on_item_clicked)
         
         # Context menu
@@ -112,6 +115,185 @@ class XmlTreeWidget(QTreeWidget):
         except Exception:
             pass
 
+    def mimeData(self, items):
+        """Create mime data for dragged items"""
+        mime_data = QMimeData()
+        
+        # We only support dragging one item at a time for now
+        if not items:
+            return mime_data
+            
+        item = items[0]
+        if not hasattr(item, 'xml_node'):
+            return mime_data
+            
+        node = item.xml_node
+        
+        # Create a serializable dictionary
+        data = {
+            'tag': getattr(node, 'tag', ''),
+            'name': getattr(node, 'name', ''),
+            'value': getattr(node, 'value', ''),
+            'attributes': getattr(node, 'attributes', {}),
+            'path': getattr(node, 'path', ''),
+            'line_number': getattr(node, 'line_number', 0)
+        }
+        
+        mime_data.setData('application/x-lotus-xml-node', json.dumps(data).encode('utf-8'))
+        return mime_data
+
+    def _open_object_view(self, item):
+        """Open object viewer for the selected item"""
+        if not hasattr(item, 'xml_node'):
+            return
+        
+        try:
+            form = ObjectNodeForm(item.xml_node, self)
+            form.jump_to_source_requested.connect(lambda node: self._on_jump_to_source(node, form))
+            form.show()
+            # Keep reference to prevent garbage collection
+            if not hasattr(self, '_object_forms'):
+                self._object_forms = []
+            self._object_forms.append(form)
+            # Cleanup when closed
+            form.finished.connect(lambda: self._object_forms.remove(form) if form in self._object_forms else None)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to open object view: {str(e)}")
+
+    def select_node(self, target_node):
+        """Select a specific node in the tree, expanding path as needed"""
+        if not target_node or not getattr(target_node, 'path', None):
+            return
+
+        # Path format: /Root[1]/Child[1]/GrandChild[2]
+        # Remove leading slash and split
+        path_parts = target_node.path.strip('/').split('/')
+        if not path_parts:
+            return
+
+        # Start search from top level items
+        current_item = None
+        
+        # 1. Find Root
+        root_part = path_parts[0]
+        root_tag, root_idx = self._parse_path_part(root_part)
+        
+        for i in range(self.topLevelItemCount()):
+            item = self.topLevelItem(i)
+            if self._match_node(item, root_tag, root_idx, f"/{root_part}"):
+                current_item = item
+                break
+        
+        if not current_item:
+            return
+
+        # 2. Traverse down
+        current_path = f"/{root_part}"
+        
+        for part in path_parts[1:]:
+            # Ensure current item is expanded to load children
+            if not current_item.isExpanded():
+                current_item.setExpanded(True)
+                QApplication.processEvents()
+            
+            tag, idx = self._parse_path_part(part)
+            current_path += f"/{part}"
+            
+            found_child = False
+            
+            # Loop to handle dynamic loading (loaders)
+            max_loader_loops = 100 # Safety break
+            loop_count = 0
+            
+            while loop_count < max_loader_loops:
+                loop_count += 1
+                
+                # Scan current children
+                for i in range(current_item.childCount()):
+                    child = current_item.child(i)
+                    
+                    # Skip placeholders/loaders for matching
+                    if getattr(child, 'is_loader', False) or getattr(child, 'is_loader_node', False):
+                        continue
+                        
+                    if self._match_node(child, tag, idx, current_path):
+                        current_item = child
+                        found_child = True
+                        break
+                
+                if found_child:
+                    break
+                    
+                # If not found, check for loader
+                loader = None
+                for i in range(current_item.childCount()):
+                    child = current_item.child(i)
+                    if getattr(child, 'is_loader', False) or getattr(child, 'is_loader_node', False):
+                        loader = child
+                        break
+                
+                if loader:
+                    loader.setExpanded(True)
+                    QApplication.processEvents()
+                else:
+                    # No loader and not found -> path doesn't exist
+                    return
+
+        # 3. Select final item
+        if current_item:
+            self.setCurrentItem(current_item)
+            self.scrollToItem(current_item)
+            self._on_item_clicked(current_item, 0)
+
+    def _parse_path_part(self, part):
+        """Parse 'Tag[Index]' into (Tag, Index)"""
+        if '[' in part and part.endswith(']'):
+            tag = part[:part.rfind('[')]
+            idx_str = part[part.rfind('[')+1:-1]
+            try:
+                return tag, int(idx_str)
+            except:
+                return tag, 1
+        return part, 1
+
+    def _match_node(self, item, tag, idx, path):
+        """Check if item matches tag, index and path"""
+        node = getattr(item, 'xml_node', None)
+        if not node:
+            return False
+        
+        # Check path exact match (most reliable)
+        if hasattr(node, 'path') and node.path == path:
+            return True
+            
+        return False
+
+    def _on_jump_to_source(self, node, form):
+        """Handle jump to source request from object form"""
+        try:
+            # 1. Select in Tree
+            # We need to find the item in the tree that corresponds to this node
+            # This is tricky because the tree might be lazy loaded.
+            # But we can try to find by matching node object if it exists
+            
+            # Simple approach: Emit signal to MainWindow to handle selection/scrolling
+            # But XmlTreeWidget is a widget, not the MainWindow.
+            # We can access MainWindow via window()
+            
+            main_window = self.window()
+            if hasattr(main_window, 'select_node_and_scroll'):
+                main_window.select_node_and_scroll(node)
+            elif hasattr(main_window, 'xml_editor') and node.line_number > 0:
+                # Scroll editor directly
+                main_window.xml_editor.highlight_line(node.line_number)
+                # Ideally also select in tree
+                
+            # Focus the main window
+            main_window.activateWindow()
+            
+        except Exception as e:
+            print(f"Jump to source failed: {e}")
+
     def _show_context_menu(self, position):
         """Show context menu for tree items"""
         item = self.itemAt(position)
@@ -119,6 +301,12 @@ class XmlTreeWidget(QTreeWidget):
             return
             
         menu = QMenu(self)
+        
+        # Object View Action
+        view_object_action = QAction("Open Object View", self)
+        view_object_action.triggered.connect(lambda: self._open_object_view(item))
+        menu.addAction(view_object_action)
+        menu.addSeparator()
         
         # Expand actions
         expand_action = QAction("Expand All Children", self)
@@ -243,6 +431,9 @@ class XmlTreeWidget(QTreeWidget):
                 main_window.status_bar.removeWidget(progress_dialog)
             progress_dialog.deleteLater()
         self.setUpdatesEnabled(True)
+        
+        # Signal that tree is ready
+        self.tree_built.emit()
 
         self._xml_root = None
         self._xml_lines = []
@@ -268,21 +459,30 @@ class XmlTreeWidget(QTreeWidget):
              return f"{xml_node.tag} [{attr_string}]" if attr_string else f"{xml_node.tag}"
         
         preferred_name = None
+        fallback_name = None
         found = False
         
         # Try XmlTreeNode children first (populated nodes)
         try:
             children = getattr(xml_node, 'children', []) or []
             if children:
-                # Limit scan to first 50 children to prevent freeze on massive nodes
-                for child in children[:50]:
+                # Limit scan to first 6 children to prevent freeze on massive nodes
+                for child in children[:6]:
                     tag = getattr(child, 'tag', '')
-                    if tag and tag.lower() in ("наименование", "имя", "name") and getattr(child, 'value', None):
+                    if not tag:
+                        continue
+                    tag_lower = tag.lower()
+
+                    if tag_lower in ("наименование", "имя", "name") and getattr(child, 'value', None):
                         text = child.value.strip()
                         if text:
                             preferred_name = text
                             found = True
                             break
+                    elif tag_lower == "код" and getattr(child, 'value', None):
+                        text = child.value.strip()
+                        if text:
+                            fallback_name = text
         except Exception:
             pass
 
@@ -301,14 +501,23 @@ class XmlTreeWidget(QTreeWidget):
                     if isinstance(tag, str) and '}' in tag:
                         tag = tag.split('}', 1)[1]
                         
-                    if tag and tag.lower() in ("наименование", "имя", "name"):
-                        text = getattr(child, 'text', '')
-                        if text and text.strip():
-                            preferred_name = text.strip()
-                            found = True
-                            break
+                    if tag:
+                        tag_lower = tag.lower()
+                        if tag_lower in ("наименование", "имя", "name"):
+                            text = getattr(child, 'text', '')
+                            if text and text.strip():
+                                preferred_name = text.strip()
+                                found = True
+                                break
+                        elif tag_lower == "код" and not fallback_name:
+                            text = getattr(child, 'text', '')
+                            if text and text.strip():
+                                fallback_name = text.strip()
             except Exception:
                 pass
+        
+        if not found and fallback_name:
+            preferred_name = fallback_name
 
         # 3. Format based on mode
         # Friendly mode: "Friendly (Tag [attrs])"
@@ -614,6 +823,8 @@ class XmlTreeWidget(QTreeWidget):
                     self.setUpdatesEnabled(True)
                     if self.status_label:
                         self.status_label.setText("Loaded from cache")
+                    # Signal tree built
+                    self.tree_built.emit()
                     return
             except Exception as e:
                 print(f"Cache load failed: {e}")
@@ -675,6 +886,8 @@ class XmlTreeWidget(QTreeWidget):
                 self.apply_hide_leaves_filter()
                 # Re-enable updates after normal file processing
                 self.setUpdatesEnabled(True)
+                # Signal tree built
+                self.tree_built.emit()
 
     def _on_item_expanded(self, item):
         try:
@@ -1172,792 +1385,459 @@ class ProgressPopup(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
 
-class XmlEditorWidget(QTextEdit):
-    """Custom text editor for XML with syntax highlighting"""
+class XmlEditorWidget(QsciScintilla):
+    """Custom text editor for XML with QScintilla"""
     content_changed = pyqtSignal()
     cursor_position_changed = pyqtSignal(int, int)
     fragment_editor_requested = pyqtSignal()
+    definition_lookup_requested = pyqtSignal(str)
     modification_changed = pyqtSignal(bool)
     
+    class LineNumberWidgetAdapter:
+        def __init__(self, editor):
+            self.editor = editor
+            self.folding_enabled = True
+
+        def isVisible(self):
+            return self.editor.marginWidth(0) > 0
+
+        def show(self):
+            self.editor.setMarginType(0, QsciScintilla.MarginType.NumberMargin)
+            self.editor.setMarginWidth(0, "00000")
+
+        def hide(self):
+            self.editor.setMarginWidth(0, 0)
+            
+        def set_folding_enabled(self, enabled):
+            self.folding_enabled = enabled
+            
+        def update(self, *args):
+            pass 
+            
+        def calculate_width(self):
+            return 0 
+            
+        def setGeometry(self, *args):
+            pass
+
+
     def __init__(self):
         super().__init__()
-        self.setFont(QFont("Consolas", 11))
-        self.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        # Accept drag-and-drop for opening files
+        
+        # Visibility options (Must be before lexer config)
+        self.visibility_options = {
+            'hide_symbols': False,
+            'hide_tags': False,
+            'hide_values': False
+        }
+        self.is_dark_theme = False
+        
+        
+        # Font setup
+        font_family = "Consolas"
+        font_size = 11
+        try:
+            settings = QSettings("visxml.net", "LotusXmlEditor")
+            font_family = settings.value("editor_font_family", "Consolas")
+            font_size = int(settings.value("editor_font_size", 11))
+        except Exception:
+            pass
+            
+        font = QFont(font_family, font_size)
+        self.setFont(font)
+        self.setMarginsFont(font)
+        
+        # Lexer setup
+        self._configure_lexer()
+        
+        # Encoding
+        self.setUtf8(True)
+        
+        # Indicators
+        self._init_indicators()
+        
+        # Drag and drop
         self.setAcceptDrops(True)
         
         # Flags
         self.enable_occurrence_highlighting = True
         
-        # Set up syntax highlighter
-        self.highlighter = XmlHighlighter(self.document())
-        
-        # Track folded ranges as (start_line, end_line) tuples, 1-based inclusive
-        self._folded_ranges = []
-        
-        # Bookmarks for this editor {line_number: description}
+        # Bookmarks & File info
         self.bookmarks = {}
-        # Numbered bookmarks for this editor {digit: line_number}
         self.numbered_bookmarks = {}
-        
-        # File path associated with this editor
         self.file_path = None
-        
-        # Zip source info if file is from a zip archive
-        # Format: {'zip_path': str, 'arc_name': str, 'temp_dir': str}
         self.zip_source = None
+        self._folded_ranges = []
+
+        # Line Number Adapter
+        self.line_number_widget = self.LineNumberWidgetAdapter(self)
         
-        # Line number widget
-        self.line_number_widget = LineNumberWidget(self)
-        self.line_number_widget.hide()  # Hidden by default
-        
-        # Connect signals
+        # Signals
         self.textChanged.connect(self.content_changed)
-        self.document().modificationChanged.connect(self.modification_changed.emit)
+        self.modificationChanged.connect(self.modification_changed.emit)
         self.cursorPositionChanged.connect(self._on_cursor_changed)
-        # Ensure content edits do not leave stale folded state
-        self.textChanged.connect(self._on_content_edited_unfold_all)
-        # Highlight all occurrences of selected text
         self.selectionChanged.connect(self.highlight_all_occurrences)
         
-        # Update line numbers on changes
-        self.textChanged.connect(self._update_line_number_width)
-        self.verticalScrollBar().valueChanged.connect(self.line_number_widget.update)
+        # Initial Setup
+        self.set_line_numbers_visible(False)
+        self.set_code_folding_enabled(True)
+        self.highlighter = None
         
-        # Set up tab behavior
-        self.setTabStopDistance(40)  # 4 spaces
-    
+        # Tab settings
+        self.setIndentationsUseTabs(False)
+        self.setTabWidth(4)
+        self.setIndentationGuides(True)
+        self.setAutoIndent(True)
+        self.setWrapMode(QsciScintilla.WrapMode.WrapNone)
+
+        # Occurrence highlighting
+        self._occurrence_indicators = []
+        
+        # Visibility options
+        self.visibility_options = {
+            'hide_symbols': False,
+            'hide_tags': False,
+            'hide_values': False
+        }
+        self.is_dark_theme = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            # Handle Ctrl+Click for definition lookup
+            pos = event.pos()
+            # Convert visual position to scintilla position
+            scint_pos = self.SendScintilla(QsciScintilla.SCI_POSITIONFROMPOINT, pos.x(), pos.y())
+            
+            if scint_pos != -1:
+                line, index = self.lineIndexFromPosition(scint_pos)
+                # Get line text
+                text = self.text(line)
+                if index < len(text):
+                    # Check if inside quotes
+                    self._check_definition_lookup(text, index)
+        
+        super().mousePressEvent(event)
+
+    def _check_definition_lookup(self, text, index):
+        """Check if cursor is inside a quoted string and if it matches a definition pattern"""
+        try:
+            # Find quotes around the index
+            # Simple logic: search backwards for " and forwards for "
+            # This is naive but often sufficient for simple XML attributes
+            
+            # Find opening quote before index
+            start_quote = -1
+            for i in range(index, -1, -1):
+                if text[i] == '"':
+                    start_quote = i
+                    break
+            
+            if start_quote == -1:
+                return
+
+            # Find closing quote after index
+            end_quote = -1
+            for i in range(index, len(text)):
+                if text[i] == '"':
+                    end_quote = i
+                    break
+            
+            if end_quote == -1:
+                return
+            
+            # Ensure we are inside the quotes (not on them)
+            if start_quote < index < end_quote:
+                content = text[start_quote+1 : end_quote]
+                # Check pattern
+                if content.startswith("Запросы.") or content.startswith("Алгоритмы."):
+                    self.definition_lookup_requested.emit(content)
+
+        except Exception as e:
+            print(f"Definition lookup check error: {e}")
+
+    def get_cursor_char_position(self):
+        """Get the character index of the cursor relative to the start of the document."""
+        line, index = self.getCursorPosition()
+        pos = 0
+        # Sum lengths of previous lines
+        # Note: text(i) returns the line content including newline
+        for i in range(line):
+            pos += len(self.text(i))
+        pos += index
+        return pos
+
+    def navigate_to(self, line_one_based: int, column: int = 0, select_length: int = 0):
+        """Navigate to a specific line and column, optionally selecting text."""
+        if line_one_based <= 0:
+            return
+            
+        line_idx = line_one_based - 1
+        
+        # Ensure line exists
+        if line_idx >= self.lines():
+            line_idx = self.lines() - 1
+            
+        # Move cursor
+        self.setCursorPosition(line_idx, column)
+        self.ensureLineVisible(line_idx)
+        self.ensureCursorVisible()
+        
+        # Select if requested
+        if select_length > 0:
+            # We need to calculate end position
+            # QScintilla selection is (line_from, index_from, line_to, index_to)
+            # This is complicated if the selection spans lines.
+            # Assuming single line selection for now as mostly used for search results
+            self.setSelection(line_idx, column, line_idx, column + select_length)
+            
+        self.setFocus()
+
+    def get_selected_text(self):
+        """Get currently selected text."""
+        return self.selectedText()
+
     def set_line_numbers_visible(self, visible: bool):
-        """Show or hide line numbers"""
         if visible:
             self.line_number_widget.show()
-            self._update_line_number_width()
         else:
             self.line_number_widget.hide()
-            self.setViewportMargins(0, 0, 0, 0)
+
+    def set_code_folding_enabled(self, enabled: bool):
+        self.line_number_widget.set_folding_enabled(enabled)
+        if enabled:
+            self.setMarginType(1, QsciScintilla.MarginType.SymbolMargin)
+            self.setMarginWidth(1, 20)
+            self.setFolding(QsciScintilla.FoldStyle.BoxedTreeFoldStyle)
+        else:
+            self.setMarginWidth(1, 0)
+            self.setFolding(QsciScintilla.FoldStyle.NoFoldStyle)
+            self.unfold_all()
+
+    def _on_cursor_changed(self, line, index):
+        self.cursor_position_changed.emit(line + 1, index + 1)
+
+    def get_content(self) -> str:
+        return self.text()
     
-    def _update_line_number_width(self):
-        """Update the viewport margins to make room for line numbers"""
-        if self.line_number_widget.isVisible():
-            width = self.line_number_widget.calculate_width()
-            self.setViewportMargins(width, 0, 0, 0)
-    
-    def resizeEvent(self, event):
-        """Update line number widget geometry on resize"""
-        super().resizeEvent(event)
-        cr = self.contentsRect()
-        self.line_number_widget.setGeometry(
-            cr.left(), cr.top(), 
-            self.line_number_widget.calculate_width(), 
-            cr.height()
-        )
+    def set_content(self, content: str):
+        self.setText(content)
+
+
+    def highlight_line(self, line_number: int):
+        if line_number <= 0:
+            return
+        line_idx = line_number - 1
+        self.setCursorPosition(line_idx, 0)
+        self.ensureLineVisible(line_idx)
+        self.setSelection(line_idx, 0, line_idx + 1, 0)
+
+    def _configure_lexer(self):
+        lexer = QsciLexerXML(self)
+        lexer.setDefaultFont(self.font())
+        self.setLexer(lexer)
+        # Apply default light theme initially
+        self.set_dark_theme(False)
+
+    def set_dark_theme(self, dark_theme=True):
+        """Apply dark or light theme colors to the lexer."""
+        self.is_dark_theme = dark_theme
+        self.update_colors()
+
+    def set_visibility_options(self, hide_symbols=False, hide_tags=False, hide_values=False):
+        """Set visibility options for syntax highlighting."""
+        self.visibility_options = {
+            'hide_symbols': hide_symbols,
+            'hide_tags': hide_tags,
+            'hide_values': hide_values
+        }
+        self.update_colors()
+
+    def update_colors(self):
+        """Update lexer colors based on theme and visibility options."""
+        lexer = self.lexer()
+        if not lexer:
+            return
+
+        dark_theme = self.is_dark_theme
+        
+        if dark_theme:
+            # Dark Theme Colors
+            default_color = QColor("#D4D4D4") # Light Grey
+            background_color = QColor("#1e1e1e")
+            
+            tag_color = QColor("#569CD6") # Blue
+            attr_color = QColor("#D4D4D4") # Light Grey
+            value_color = QColor("#B5CEA8") # Light Green
+            comment_color = QColor("#6A9955") # Green
+            cdata_color = QColor("#D7BA7D") # Light yellow
+            entity_color = QColor("#C586C0") # Pink
+            
+            # Set background
+            self.setColor(default_color)
+            self.setPaper(background_color)
+            self.setMarginsBackgroundColor(QColor("#252526"))
+            self.setMarginsForegroundColor(QColor("#858585"))
+            self.setCaretForegroundColor(QColor("#ffffff"))
+            
+        else:
+            # Light Theme Colors (Modern/VS Code style)
+            default_color = QColor("#000000") # Black
+            background_color = QColor("#ffffff") # White
+            
+            tag_color = QColor("#0000FF") # Blue (Keywords)
+            attr_color = QColor("#A31515") # Dark Red (Attributes)
+            value_color = QColor("#008000") # Green (Strings)
+            comment_color = QColor("#008000") # Green
+            cdata_color = QColor("#8B4513") # Brown
+            entity_color = QColor("#FF00FF") # Magenta
+            
+            # Set background
+            self.setColor(default_color)
+            self.setPaper(background_color)
+            self.setMarginsBackgroundColor(QColor("#f0f0f0"))
+            self.setMarginsForegroundColor(QColor("#333333"))
+            self.setCaretForegroundColor(QColor("#000000"))
+
+        # Apply visibility overrides (hide by setting to background color)
+        if self.visibility_options['hide_tags'] or self.visibility_options['hide_symbols']:
+            tag_color = background_color
+            
+        if self.visibility_options['hide_values']:
+            value_color = background_color
+
+        # Lexer colors
+        lexer.setColor(default_color, QsciLexerXML.Default)
+        lexer.setColor(tag_color, QsciLexerXML.Tag)
+        lexer.setColor(attr_color, QsciLexerXML.Attribute)
+        lexer.setColor(value_color, QsciLexerXML.HTMLDoubleQuotedString)
+        lexer.setColor(value_color, QsciLexerXML.HTMLSingleQuotedString)
+        lexer.setColor(comment_color, QsciLexerXML.HTMLComment)
+        lexer.setColor(cdata_color, QsciLexerXML.CDATA)
+        lexer.setColor(entity_color, QsciLexerXML.Entity)
+        
+        if dark_theme:
+            lexer.setColor(QColor("#569CD6"), QsciLexerXML.XMLStart) # Processing instruction
+        else:
+            lexer.setColor(QColor("#0000FF"), QsciLexerXML.XMLStart)
+
+    def highlight_all_occurrences(self):
+        """Highlights all occurrences of the currently selected text."""
+        # Clear existing indicators
+        self.clearIndicatorRange(0, 0, self.lines(), self.lineLength(self.lines()-1), 8)
+        
+        # Get selected text
+        text = self.selectedText()
+        print(f"DEBUG: highlight_all_occurrences selected text: '{text}'")
+        if not text:
+            return
+            
+        # Don't highlight if text is too short or too long
+        if len(text) < 2 or len(text) > 100:
+            return
+            
+        # Search and highlight
+        search_bytes = text.encode('utf-8')
+        
+        for line_idx in range(self.lines()):
+            line_text = self.text(line_idx)
+            # Ensure we have bytes for searching to match QScintilla's internal byte offsets
+            line_bytes = line_text.encode('utf-8')
+            
+            start_idx = 0
+            while True:
+                idx = line_bytes.find(search_bytes, start_idx)
+                if idx == -1:
+                    break
+                
+                # fillIndicatorRange uses byte offsets in UTF-8 mode
+                print(f"DEBUG: Filling indicator at line {line_idx}, start {idx}, len {len(search_bytes)}")
+                self.fillIndicatorRange(line_idx, idx, line_idx, idx + len(search_bytes), 8)
+                
+                start_idx = idx + len(search_bytes)
+
+    def _init_indicators(self):
+        # Indicator 8 for highlighting occurrences
+        self.indicatorDefine(QsciScintilla.IndicatorStyle.StraightBoxIndicator, 8)
+        self.setIndicatorForegroundColor(QColor("purple"), 8)
+        self.setIndicatorDrawUnder(True, 8) # Draw under text
+
+
+    def _is_fold_line(self, line):
+        # SC_FOLDLEVELHEADERFLAG = 0x2000
+        level = self.SendScintilla(QsciScintilla.SCI_GETFOLDLEVEL, line)
+        return bool(level & 0x2000)
+
+    def _is_fold_expanded(self, line):
+        return bool(self.SendScintilla(QsciScintilla.SCI_GETFOLDEXPANDED, line))
+
+    def fold_lines(self, start_line_one_based: int, end_line_one_based: int):
+        line = start_line_one_based - 1
+        if self._is_fold_line(line) and self._is_fold_expanded(line):
+            self.foldLine(line)
+
+    def unfold_lines(self, start_line_one_based: int, end_line_one_based: int):
+        line = start_line_one_based - 1
+        if self._is_fold_line(line) and not self._is_fold_expanded(line):
+            self.foldLine(line)
+
+    def fold_multiple_lines(self, ranges: list):
+        for start, end in ranges:
+            line = start - 1
+            if self._is_fold_line(line) and self._is_fold_expanded(line):
+                self.foldLine(line)
+
+    def unfold_all(self):
+        self.foldAll(False)
 
     def contextMenuEvent(self, event):
-        """Custom context menu with fragment editor option."""
-        menu = self.createStandardContextMenu()
+        menu = QMenu(self)
+        menu.addAction("Undo", self.undo, QKeySequence("Ctrl+Z"))
+        menu.addAction("Redo", self.redo, QKeySequence("Ctrl+Y"))
+        menu.addSeparator()
+        menu.addAction("Cut", self.cut, QKeySequence("Ctrl+X"))
+        menu.addAction("Copy", self.copy, QKeySequence("Ctrl+C"))
+        menu.addAction("Paste", self.paste, QKeySequence("Ctrl+V"))
+        menu.addSeparator()
+        menu.addAction("Select All", self.selectAll, QKeySequence("Ctrl+A"))
         menu.addSeparator()
         
+        main_window = self.window()
+        if hasattr(main_window, 'toggle_comment'):
+            toggle_comment_action = menu.addAction("Toggle Comment")
+            toggle_comment_action.setShortcut("Ctrl+/")
+            toggle_comment_action.triggered.connect(main_window.toggle_comment)
+            
+        if hasattr(main_window, 'remove_empty_lines'):
+            remove_empty_lines_action = menu.addAction("Remove Empty Lines")
+            remove_empty_lines_action.triggered.connect(main_window.remove_empty_lines)
+            
+        menu.addSeparator()
         fragment_action = menu.addAction("Open Selected Fragment in New Window")
         fragment_action.setShortcut("F8")
         fragment_action.triggered.connect(self.fragment_editor_requested.emit)
         
         menu.exec(event.globalPos())
-    
-    def highlight_all_occurrences(self):
-        """Highlight all occurrences of the currently selected text."""
-        try:
-            # Check if feature is enabled
-            if not self.enable_occurrence_highlighting:
-                # Clear existing selections if any (except standard selection)
-                # But we can't easily distinguish. 
-                # Ideally, we just don't add new ones. 
-                # If we want to clear old ones, we should do it when disabling.
-                return
 
-            extra_selections = []
-            
-            # Preserve existing extra selections (e.g. current line highlight if any)
-            # Note: If we had other permanent selections, we might want to keep them.
-            # For now, we assume we control the extra selections or want to clear them.
-            # If we want to be safe, we could copy self.extraSelections() but filter out previous highlights.
-            # simpler approach: just rebuild.
-            
-            cursor = self.textCursor()
-            if cursor.hasSelection():
-                selected_text = cursor.selectedText()
-                # Only highlight if length > 1 to avoid flashing on single chars
-                if len(selected_text) > 1:
-                    # Use a distinct color for occurrence highlighting
-                    color = QColor(Qt.GlobalColor.yellow)
-                    color.setAlpha(100) # Semi-transparent
-                    
-                    # Search entire document
-                    doc = self.document()
-                    search_cursor = QTextCursor(doc)
-                    
-                    while True:
-                        search_cursor = doc.find(selected_text, search_cursor)
-                        if search_cursor.isNull():
-                            break
-                        
-                        selection = QTextEdit.ExtraSelection()
-                        selection.format.setBackground(color)
-                        selection.cursor = search_cursor
-                        extra_selections.append(selection)
-            
-            self.setExtraSelections(extra_selections)
-            
-        except Exception:
-            pass
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
 
-    def _on_cursor_changed(self):
-        """Handle cursor position change"""
-        cursor = self.textCursor()
-        line = cursor.blockNumber() + 1
-        column = cursor.columnNumber() + 1
-        self.cursor_position_changed.emit(line, column)
-
+    def _update_line_number_width(self):
+        pass
+        
     def _on_content_edited_unfold_all(self):
-        """Unfold everything when content changes to avoid desync."""
-        try:
-            if self._folded_ranges:
-                self.unfold_all()
-        except Exception:
-            pass
-    
-    def get_content(self) -> str:
-        """Get editor content"""
-        return self.toPlainText()
-    
-    def set_content(self, content: str):
-        """Set editor content"""
-        self.setPlainText(content)
-
-
-    # --- Folding helpers ---
-    def fold_lines(self, start_line_one_based: int, end_line_one_based: int):
-        """Fold by hiding inner lines between start and end (inclusive lines, inner only)."""
-        self.fold_multiple_lines([(start_line_one_based, end_line_one_based)])
-
-    def fold_multiple_lines(self, ranges: list):
-        """Fold multiple ranges efficiently."""
-        try:
-            doc = self.document()
-            modified = False
-            
-            for start_line_one_based, end_line_one_based in ranges:
-                if start_line_one_based <= 0 or end_line_one_based <= 0:
-                    continue
-                if end_line_one_based <= start_line_one_based:
-                    continue
-                    
-                start = max(0, start_line_one_based - 1)
-                end = max(0, end_line_one_based - 1)
-                
-                # Hide inner blocks and the closing line (to avoid empty space/dangling closing tag)
-                # Range is [start + 1, end]
-                blk = doc.findBlockByNumber(start + 1)
-                while blk.isValid() and blk.blockNumber() <= end:
-                    try:
-                        if blk.isVisible():
-                            blk.setVisible(False)
-                            modified = True
-                    except Exception:
-                        break
-                    blk = blk.next()
-                    
-                rng = (start_line_one_based, end_line_one_based)
-                if rng not in self._folded_ranges:
-                    self._folded_ranges.append(rng)
-            
-            if modified:
-                try:
-                    doc.documentLayout().update()
-                    self.viewport().update()
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"Fold multiple error: {e}")
-
-    def unfold_lines(self, start_line_one_based: int, end_line_one_based: int):
-        """Unfold by showing previously hidden inner lines between start and end."""
-        try:
-            if start_line_one_based <= 0 or end_line_one_based <= 0:
-                return
-            doc = self.document()
-            start = max(0, start_line_one_based - 1)
-            end = max(0, end_line_one_based - 1)
-            blk = doc.findBlockByNumber(start + 1)
-            while blk.isValid() and blk.blockNumber() <= end:
-                try:
-                    blk.setVisible(True)
-                except Exception as e:
-                    print(f"Error unfolding block {blk.blockNumber()}: {e}")
-                blk = blk.next()
-            try:
-                doc.documentLayout().update()
-                self.viewport().update()
-            except Exception:
-                pass
-            rng = (start_line_one_based, end_line_one_based)
-            try:
-                self._folded_ranges = [r for r in self._folded_ranges if r != rng]
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"Unfold error: {e}")
-
-    def unfold_all(self):
-        """Unfold all hidden blocks."""
-        try:
-            doc = self.document()
-            blk = doc.firstBlock()
-            while blk.isValid():
-                try:
-                    blk.setVisible(True)
-                except Exception as e:
-                    print(f"Error making block {blk.blockNumber()} visible: {e}")
-                blk = blk.next()
-            try:
-                doc.documentLayout().update()
-                self.viewport().update()
-            except Exception:
-                pass
-            self._folded_ranges = []
-        except Exception as e:
-            print(f"Unfold-all error: {e}")
-    
-    def keyPressEvent(self, event):
-        """Handle key press events for navigation, bookmarks, and tree sync"""
-        # User-defined editing shortcuts
-        try:
-            # Ctrl+Shift+Up/Down: move selected lines up/down
-            if event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
-                if event.key() == Qt.Key.Key_Up:
-                    self._move_selected_lines(-1)
-                    event.accept()
-                    return
-                elif event.key() == Qt.Key.Key_Down:
-                    self._move_selected_lines(1)
-                    event.accept()
-                    return
-                elif event.key() == Qt.Key.Key_BracketLeft:
-                    # Fold current element at cursor
-                    try:
-                        self.window().fold_current_element()
-                    except Exception as e:
-                        print(f"Fold current element error: {e}")
-                    event.accept()
-                    return
-                elif event.key() == Qt.Key.Key_BracketRight:
-                    # Unfold current element at cursor
-                    try:
-                        self.window().unfold_current_element()
-                    except Exception as e:
-                        print(f"Unfold current element error: {e}")
-                    event.accept()
-                    return
-            # Ctrl+L: delete current line or selected lines
-            if event.key() == Qt.Key.Key_L and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-                self._delete_selected_lines()
-                event.accept()
-                return
-            # Ctrl+/ : toggle comment (context sensitive)
-            if event.key() == Qt.Key.Key_Slash and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-                try:
-                    self.window().toggle_comment()
-                except Exception:
-                    # Fallback to default line comment if window method fails
-                    self._toggle_line_comments(prefix="//")
-                event.accept()
-                return
-            # Ctrl+] : Jump to matching closing tag
-            if event.key() == Qt.Key.Key_BracketRight and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-                try:
-                    self.window().jump_to_matching_tag('next_close')
-                except Exception as e:
-                    print(f"Jump matching tag error: {e}")
-                event.accept()
-                return
-            # Ctrl+[ : Jump to matching opening tag
-            if event.key() == Qt.Key.Key_BracketLeft and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-                try:
-                    self.window().jump_to_matching_tag('prev_open')
-                except Exception as e:
-                    print(f"Jump matching tag error: {e}")
-                event.accept()
-                return
-            # Ctrl+\ : Cycle syntax language
-            if event.key() == Qt.Key.Key_Backslash and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-                try:
-                    self.window().cycle_syntax_language()
-                except Exception:
-                    pass
-                event.accept()
-                return
-            # Ctrl+Shift+0: Unfold all
-            if event.key() == Qt.Key.Key_0 and event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
-                try:
-                    self.unfold_all()
-                except Exception:
-                    pass
-                event.accept()
-                return
-        except Exception as e:
-            print(f"Custom shortcut error: {e}")
-
-        # Numbered bookmarks: set with Ctrl+Shift+1..9, focus with Ctrl+1..9
-        try:
-            mods = event.modifiers()
-            has_ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
-            has_shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
-            has_alt = bool(mods & Qt.KeyboardModifier.AltModifier)
-            has_keypad = bool(mods & Qt.KeyboardModifier.KeypadModifier)
-
-            # Map both digit keys and their shifted symbols to 1..9
-            key = event.key()
-            digit_map = {
-                Qt.Key.Key_1: 1, Qt.Key.Key_2: 2, Qt.Key.Key_3: 3, Qt.Key.Key_4: 4,
-                Qt.Key.Key_5: 5, Qt.Key.Key_6: 6, Qt.Key.Key_7: 7, Qt.Key.Key_8: 8,
-                Qt.Key.Key_9: 9,
-                # Shifted symbols on US layout
-                Qt.Key.Key_Exclam: 1,      # Shift+1
-                Qt.Key.Key_At: 2,          # Shift+2
-                Qt.Key.Key_NumberSign: 3,  # Shift+3
-                Qt.Key.Key_Dollar: 4,      # Shift+4
-                Qt.Key.Key_Percent: 5,     # Shift+5
-                Qt.Key.Key_AsciiCircum: 6, # Shift+6
-                Qt.Key.Key_Ampersand: 7,   # Shift+7
-                Qt.Key.Key_Asterisk: 8,    # Shift+8
-                Qt.Key.Key_ParenLeft: 9    # Shift+9
-            }
-            if key in digit_map:
-                digit = digit_map[key]
-                if has_ctrl and has_shift and not has_alt:
-                    # Set numbered bookmark
-                    try:
-                        self.window().set_numbered_bookmark(digit)
-                    except Exception:
-                        pass
-                    event.accept()
-                    return
-                elif has_ctrl and not has_shift and not has_alt:
-                    # Go to numbered bookmark (supports keypad too)
-                    try:
-                        self.window().goto_numbered_bookmark(digit)
-                    except Exception:
-                        pass
-                    event.accept()
-                    return
-        except Exception:
-            pass
-
-        # Ctrl+Shift+B: Clear all bookmarks; Ctrl+B: Toggle bookmark at cursor
-        try:
-            if event.key() == Qt.Key.Key_B:
-                mods = event.modifiers()
-                has_ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
-                has_shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
-                if has_ctrl and has_shift:
-                    try:
-                        self.window().clear_bookmarks()
-                    except Exception:
-                        pass
-                    event.accept()
-                    return
-                elif has_ctrl:
-                    try:
-                        self.window().toggle_bookmark()
-                    except Exception:
-                        pass
-                    event.accept()
-                    return
-        except Exception:
-            pass
-        # Check for Ctrl+T (Find in Tree)
-        if event.key() == Qt.Key.Key_T and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            self.window().find_in_tree()
-            event.accept()
-            return
+        pass
         
-        # Check for F3 (Find Next)
-        if event.key() == Qt.Key.Key_F3 and event.modifiers() == Qt.KeyboardModifier.NoModifier:
-            self.window().find_next()
-            event.accept()
-            return
+    def setPlainText(self, text):
+        self.setText(text)
         
-        # Check for Shift+F3 (Find Previous)
-        if event.key() == Qt.Key.Key_F3 and event.modifiers() == Qt.KeyboardModifier.ShiftModifier:
-            self.window().find_previous()
-            event.accept()
-            return
+    def toPlainText(self):
+        return self.text()
 
-        # Shift+F4 - Select XML content excluding border tags
-        if event.key() == Qt.Key.Key_F4 and event.modifiers() == Qt.KeyboardModifier.ShiftModifier:
-            try:
-                self.window().select_xml_node_or_parent(exclude_border_tags=True)
-            except Exception as e:
-                print(f"Shift+F4 selection error: {e}")
-            event.accept()
-            return
-
-        # F4 - Select XML node near cursor; repeated press selects parent
-        if event.key() == Qt.Key.Key_F4 and event.modifiers() == Qt.KeyboardModifier.NoModifier:
-            try:
-                self.window().select_xml_node_or_parent()
-            except Exception as e:
-                print(f"F4 selection error: {e}")
-            event.accept()
-            return
-
-        # Ctrl+F4 - Select root element
-        if event.key() == Qt.Key.Key_F4 and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            try:
-                self.window().select_root_element()
-            except Exception as e:
-                print(f"Ctrl+F4 root selection error: {e}")
-            event.accept()
-            return
-
-        # Ctrl+Alt+F4 - Cycle top-level elements
-        if event.key() == Qt.Key.Key_F4 and event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
-            try:
-                self.window().cycle_top_level_elements()
-            except Exception as e:
-                print(f"Ctrl+Alt+F4 top-level cycle error: {e}")
-            event.accept()
-            return
-
-        # F5 - Move selected text to new tab and leave link
-        if event.key() == Qt.Key.Key_F5 and event.modifiers() == Qt.KeyboardModifier.NoModifier:
-            try:
-                self.window().move_selection_to_new_tab_with_link()
-            except Exception as e:
-                print(f"F5 move to tab error: {e}")
-            event.accept()
-            return
-
-        # Shift+F5 - Replace link with edited text from separate tab
-        if event.key() == Qt.Key.Key_F5 and event.modifiers() == Qt.KeyboardModifier.ShiftModifier:
-            try:
-                self.window().replace_link_with_tab_content()
-            except Exception as e:
-                print(f"Shift+F5 replace link error: {e}")
-            event.accept()
-            return
+    def ensureCursorVisible(self):
+        pass
         
-        # Bookmark shortcuts per requested mapping
-        if event.key() == Qt.Key.Key_F2:
-            if event.modifiers() == Qt.KeyboardModifier.NoModifier:
-                # F2 - Next bookmark (cycle)
-                self.window().next_bookmark()
-                event.accept()
-                return
-            elif event.modifiers() == Qt.KeyboardModifier.ShiftModifier:
-                # Shift+F2 - Previous bookmark
-                self.window().prev_bookmark()
-                event.accept()
-                return
-
-            elif event.modifiers() == (Qt.KeyboardModifier.AltModifier):
-                # Ctrl+Alt+F2 - Set/toggle bookmark at current line
-
-                self.window().toggle_bookmark()
-                event.accept()
-                return
-
-        # Alt+1..9 - Fold level N
-        if event.modifiers() == Qt.KeyboardModifier.AltModifier:
-            key = event.key()
-            if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
-                level = key - Qt.Key.Key_0
-                try:
-                    self.window().fold_by_level(level)
-                    event.accept()
-                    return
-                except Exception:
-                    pass
-
-        # Alt+Arrow keys - Tree-backed navigation
-        if event.modifiers() == Qt.KeyboardModifier.AltModifier:
-            try:
-                if event.key() == Qt.Key.Key_Left:
-                    self.window().navigate_tree_left()
-                    event.accept()
-                    return
-                elif event.key() == Qt.Key.Key_Right:
-                    self.window().navigate_tree_right()
-                    event.accept()
-                    return
-                elif event.key() == Qt.Key.Key_Up:
-                    self.window().navigate_tree_up()
-                    event.accept()
-                    return
-                elif event.key() == Qt.Key.Key_Down:
-                    self.window().navigate_tree_down()
-                    event.accept()
-                    return
-            except Exception as e:
-                print(f"Alt+Arrow navigation error: {e}")
-
-        # Let the parent handle other keys
-        super().keyPressEvent(event)
-
-    def _get_selection_line_range(self):
-        cur = self.textCursor()
-        anchor_cur = QTextCursor(self.document())
-        anchor_cur.setPosition(cur.anchor())
-        start_line = min(cur.blockNumber(), anchor_cur.blockNumber())
-        end_line = max(cur.blockNumber(), anchor_cur.blockNumber())
-        has_sel = cur.hasSelection()
-        return start_line, end_line, has_sel
-
-    def _move_selected_lines(self, direction: int):
-        """Move selected lines up (-1) or down (+1)."""
-        try:
-            content = self.toPlainText()
-            lines = content.split('\n')
-            start_line, end_line, has_sel = self._get_selection_line_range()
-            if not lines:
-                return
-            if direction < 0:
-                if start_line == 0:
-                    return
-                segment = lines[start_line:end_line+1]
-                above = lines[start_line-1]
-                lines = lines[:start_line-1] + segment + [above] + lines[end_line+1:]
-                new_start = start_line - 1
-                new_end = end_line - 1
-            else:
-                if end_line >= len(lines) - 1:
-                    return
-                segment = lines[start_line:end_line+1]
-                below = lines[end_line+1]
-                lines = lines[:start_line] + [below] + segment + lines[end_line+2:]
-                new_start = start_line + 1
-                new_end = end_line + 1
-            self.setPlainText('\n'.join(lines))
-            # Restore selection at moved lines
-            new_cur = QTextCursor(self.document())
-            new_cur.movePosition(QTextCursor.MoveOperation.Start)
-            new_cur.movePosition(QTextCursor.MoveOperation.Down, QTextCursor.MoveMode.MoveAnchor, max(0, new_start))
-            new_cur.movePosition(QTextCursor.MoveOperation.StartOfLine)
-            if has_sel:
-                # Select full lines of the moved segment
-                new_cur.movePosition(QTextCursor.MoveOperation.Down, QTextCursor.MoveMode.KeepAnchor, max(0, new_end - new_start))
-                new_cur.movePosition(QTextCursor.MoveOperation.EndOfLine, QTextCursor.MoveMode.KeepAnchor)
-            self.setTextCursor(new_cur)
-        except Exception as e:
-            print(f"Move lines error: {e}")
-
-    def _delete_selected_lines(self):
-        """Delete current line or selected lines."""
-        try:
-            content = self.toPlainText()
-            lines = content.split('\n')
-            if not lines:
-                return
-            start_line, end_line, _ = self._get_selection_line_range()
-            # Clamp indices
-            start_line = max(0, min(start_line, len(lines)-1))
-            end_line = max(0, min(end_line, len(lines)-1))
-            # Delete range
-            del lines[start_line:end_line+1]
-            self.setPlainText('\n'.join(lines))
-            # Position cursor at start_line (or last line if at end)
-            target_line = min(start_line, max(0, len(lines)-1))
-            cur = QTextCursor(self.document())
-            cur.movePosition(QTextCursor.MoveOperation.Start)
-            cur.movePosition(QTextCursor.MoveOperation.Down, QTextCursor.MoveMode.MoveAnchor, max(0, target_line))
-            cur.movePosition(QTextCursor.MoveOperation.StartOfLine)
-            self.setTextCursor(cur)
-        except Exception as e:
-            print(f"Delete lines error: {e}")
-
-    def _toggle_line_comments(self, prefix: str = "//"):
-        """Toggle comment prefix at beginning of selected lines or current line."""
-        try:
-            content = self.toPlainText()
-            lines = content.split('\n')
-            if not lines:
-                return
-            start_line, end_line, _ = self._get_selection_line_range()
-            # Determine whether to uncomment (all targeted lines already commented)
-            def is_commented(s: str) -> bool:
-                i = 0
-                while i < len(s) and s[i].isspace():
-                    i += 1
-                return s[i:i+len(prefix)] == prefix
-            target_range = range(start_line, end_line+1)
-            uncomment = all(is_commented(lines[i]) for i in target_range if 0 <= i < len(lines))
-            for i in target_range:
-                if i < 0 or i >= len(lines):
-                    continue
-                s = lines[i]
-                j = 0
-                while j < len(s) and s[j].isspace():
-                    j += 1
-                if uncomment and s[j:j+len(prefix)] == prefix:
-                    lines[i] = s[:j] + s[j+len(prefix):]
-                else:
-                    lines[i] = s[:j] + prefix + s[j:]
-            self.setPlainText('\n'.join(lines))
-            # Restore cursor selection to modified block range
-            cur = QTextCursor(self.document())
-            cur.movePosition(QTextCursor.MoveOperation.Start)
-            cur.movePosition(QTextCursor.MoveOperation.Down, QTextCursor.MoveMode.MoveAnchor, max(0, start_line))
-            cur.movePosition(QTextCursor.MoveOperation.StartOfLine)
-            cur.movePosition(QTextCursor.MoveOperation.Down, QTextCursor.MoveMode.KeepAnchor, max(0, end_line - start_line))
-            cur.movePosition(QTextCursor.MoveOperation.EndOfLine, QTextCursor.MoveMode.KeepAnchor)
-            self.setTextCursor(cur)
-        except Exception as e:
-            print(f"Toggle comments error: {e}")
-
-    def toggle_block_comment(self, start_marker="<!--", end_marker="-->"):
-        """Toggle block comment around selection or current line."""
-        try:
-            cursor = self.textCursor()
-            if not cursor.hasSelection():
-                 cursor.select(QTextCursor.SelectionType.LineUnderCursor)
-            
-            text = cursor.selectedText()
-            # Normalize newlines
-            normalized_text = text.replace('\u2029', '\n')
-            
-            # Check if already commented
-            pattern = fr"^\s*{re.escape(start_marker)}[\s\S]*{re.escape(end_marker)}\s*$"
-            if re.match(pattern, normalized_text):
-                # Unwrap
-                s_idx = normalized_text.find(start_marker)
-                e_idx = normalized_text.rfind(end_marker)
-                
-                if s_idx != -1 and e_idx != -1 and e_idx > s_idx:
-                     # Extract inner content
-                     inner = normalized_text[s_idx+len(start_marker):e_idx]
-                     # Optional: trim one level of spacing if we added it: "<!-- content -->" -> "content"
-                     if inner.startswith(' ') and inner.endswith(' ') and len(inner) >= 2:
-                         inner = inner[1:-1]
-                     
-                     pre = normalized_text[:s_idx]
-                     post = normalized_text[e_idx+len(end_marker):]
-                     new_text = pre + inner + post
-                     cursor.insertText(new_text)
-            else:
-                # Wrap
-                # If text ends with newline, move it outside
-                trailing_newline = ""
-                if normalized_text.endswith('\n'):
-                    normalized_text = normalized_text[:-1]
-                    trailing_newline = "\n"
-                
-                cursor.insertText(f"{start_marker} {normalized_text} {end_marker}{trailing_newline}")
-        except Exception as e:
-            print(f"Toggle block comment error: {e}")
-
-    
-    def dragEnterEvent(self, event):
-        """Accept drag events with file URLs"""
-        try:
-            mime_data = event.mimeData()
-            if mime_data.hasUrls():
-                for url in mime_data.urls():
-                    if url.isLocalFile():
-                        file_path = url.toLocalFile()
-                        if file_path.lower().endswith((".xml", ".xsd", ".xsl", ".xslt")):
-                            event.acceptProposedAction()
-                            return
-            elif mime_data.hasText():
-                text = mime_data.text().strip()
-                if text and os.path.exists(text) and text.lower().endswith((".xml", ".xsd", ".xsl", ".xslt")):
-                    event.acceptProposedAction()
-                    return
-        except Exception as e:
-            print(f"Drag enter error: {e}")
-        event.ignore()
-    
-    def dragMoveEvent(self, event):
-        """Accept drag move events"""
-        try:
-            mime_data = event.mimeData()
-            if mime_data.hasUrls() or mime_data.hasText():
-                event.acceptProposedAction()
-                return
-        except Exception:
-            pass
-        event.ignore()
-    
-    def dropEvent(self, event):
-        """Handle file drop - open the file instead of inserting text"""
-        try:
-            mime_data = event.mimeData()
-            file_paths = []
-            
-            # Extract file paths from URLs
-            if mime_data.hasUrls():
-                for url in mime_data.urls():
-                    if url.isLocalFile():
-                        file_paths.append(url.toLocalFile())
-            elif mime_data.hasText():
-                text = mime_data.text().strip()
-                if text:
-                    file_paths.append(text)
-            
-            # Open the first valid XML file
-            for file_path in file_paths:
-                if os.path.exists(file_path) and file_path.lower().endswith((".xml", ".xsd", ".xsl", ".xslt")):
-                    main_window = self.window()
-                    if hasattr(main_window, 'open_file'):
-                        main_window.open_file(file_path)
-                    elif hasattr(main_window, '_load_file_from_path'):
-                        main_window._load_file_from_path(file_path)
-                    event.acceptProposedAction()
-                    return
-        except Exception as e:
-            print(f"Drop event error: {e}")
-        event.ignore()
-    
-    def contextMenuEvent(self, event):
-        """Create custom context menu for text editor"""
-        # Create context menu
-        context_menu = QMenu(self)
-        
-        # Add standard text editor actions
-        undo_action = context_menu.addAction("Undo")
-        undo_action.triggered.connect(self.undo)
-        
-        redo_action = context_menu.addAction("Redo")
-        redo_action.triggered.connect(self.redo)
-        
-        context_menu.addSeparator()
-        
-        cut_action = context_menu.addAction("Cut")
-        cut_action.triggered.connect(self.cut)
-        
-        copy_action = context_menu.addAction("Copy")
-        copy_action.triggered.connect(self.copy)
-        
-        paste_action = context_menu.addAction("Paste")
-        paste_action.triggered.connect(self.paste)
-        
-        context_menu.addSeparator()
-        
-        # Add tree sync actions
-        find_in_tree_action = context_menu.addAction("Find in Tree (Ctrl+T)")
-        find_in_tree_action.triggered.connect(self.window().find_in_tree)
-        
-        select_tree_node_action = context_menu.addAction("Select Tree Node at Cursor")
-        select_tree_node_action.triggered.connect(self._select_tree_node_at_cursor)
-        
-        context_menu.addSeparator()
-        
-        # Bookmark actions moved to Bookmarks tab; keep editor menu focused on editing
-        
-        # Show context menu at cursor position
-        context_menu.exec(event.globalPos())
-    
-    def _select_tree_node_at_cursor(self):
-        """Manually select tree node at current cursor position"""
-        self.window().find_in_tree()
+    def centerCursor(self):
+        pass
 
 
 class BottomPanel(QTabWidget):
@@ -1974,8 +1854,10 @@ class BottomPanel(QTabWidget):
         self.find_tab = QWidget()
         self.bookmarks_tab = QWidget()
         self.links_tab = QWidget()
+        self.favorites_tab = QWidget()
         
         self.addTab(self.find_tab, "Find Results")
+        self.addTab(self.favorites_tab, "Favorites")
         self.addTab(self.bookmarks_tab, "Bookmarks")
         self.addTab(self.links_tab, "Links")
         self.addTab(self.output_tab, "Output")
@@ -1986,14 +1868,29 @@ class BottomPanel(QTabWidget):
         self._setup_find_tab()
         self._setup_bookmarks_tab()
         self._setup_links_tab()
+        self._setup_favorites_tab()
+    
+    def _setup_favorites_tab(self):
+        """Setup favorites tab"""
+        layout = QVBoxLayout()
+        self.favorites_widget = FavoritesWidget()
+        layout.addWidget(self.favorites_widget)
+        self.favorites_tab.setLayout(layout)
     
     def _setup_output_tab(self):
         """Setup output tab"""
         layout = QVBoxLayout()
-        self.output_text = QTextEdit()
+        self.output_text = QsciScintilla()
+        self.output_text.setUtf8(True)
         self.output_text.setReadOnly(True)
         self.output_text.setFont(QFont("Consolas", 10))
-        self.output_text.setMaximumHeight(250)
+        # Configure minimal look for output
+        self.output_text.setMargins(0)
+        self.output_text.setMarginWidth(0, 0)
+        self.output_text.setMarginWidth(1, 0)
+        self.output_text.setPaper(QColor("#ffffff"))
+        self.output_text.setColor(QColor("#000000"))
+        
         layout.addWidget(self.output_text)
         self.output_tab.setLayout(layout)
     
@@ -2057,10 +1954,18 @@ class BottomPanel(QTabWidget):
         layout.addWidget(info_label)
         
         # Links text edit - one XPath per line
-        self.links_text = QTextEdit()
-        self.links_text.setMaximumHeight(250)
+        self.links_text = QsciScintilla()
+        self.links_text.setUtf8(True)
         self.links_text.setFont(QFont("Consolas", 9))
-        self.links_text.setPlaceholderText("XPath links will appear here...\nOne link per line")
+        self.links_text.setMargins(0)
+        self.links_text.setMarginWidth(0, 0) # No line numbers needed for simple list
+        self.links_text.setMarginWidth(1, 0)
+        # QScintilla doesn't have placeholder text, simplified
+        self.links_text.setText("<!-- XPath links will appear here... One link per line -->")
+        self.links_text.setColor(QColor("#808080")) # Gray text initially
+        
+        # Clear placeholder on first focus (simple hack) or just leave it as comment
+        
         layout.addWidget(self.links_text)
         
         self.links_tab.setLayout(layout)
@@ -2635,6 +2540,7 @@ class MainWindow(QMainWindow):
         # Auto rebuild tree flag (configurable in settings)
         self.auto_rebuild_tree = True
         self._tree_needs_rebuild = False  # Flag to track if tree needs manual rebuild
+        self._pending_tree_path = None  # Pending path for deferred restoration
         
         # Debug mode flag
         self.debug_mode = False
@@ -2643,6 +2549,7 @@ class MainWindow(QMainWindow):
         
         # Load recent files and open file if provided, otherwise open most recent
         self._load_recent_files()
+        self._load_file_states()  # Load cursor/selection states
         if file_path and os.path.exists(file_path):
             if file_path.lower().endswith('.zip'):
                 # Defer zip opening slightly to ensure UI is fully ready
@@ -2690,13 +2597,17 @@ class MainWindow(QMainWindow):
         ver_str = self._get_version_string()
         base_title = f"Lotus Xml Editor - {ver_str}"
         
+        # Update FavoritesWidget file path
+        if hasattr(self, 'bottom_panel') and hasattr(self.bottom_panel, 'favorites_widget'):
+            self.bottom_panel.favorites_widget.current_file_path = self.current_file
+        
         if self.current_file:
             filename = os.path.basename(self.current_file)
             if self.current_zip_source:
                  zip_name = os.path.basename(self.current_zip_source['zip_path'])
-                 self.setWindowTitle(f"{filename} [{zip_name}] - {base_title}")
+                 self.setWindowTitle(f"{filename} [{zip_name}] - {self.current_file} - {base_title}")
             else:
-                 self.setWindowTitle(f"{filename} - {base_title}")
+                 self.setWindowTitle(f"{filename} - {self.current_file} - {base_title}")
         else:
             self.setWindowTitle(base_title)
 
@@ -2883,6 +2794,16 @@ class MainWindow(QMainWindow):
         goto_action.triggered.connect(self.show_goto_dialog)
         edit_menu.addAction(goto_action)
         
+        remove_empty_lines_action = QAction("Remove Empty Lines", self)
+        remove_empty_lines_action.setToolTip("Remove empty lines from selected text")
+        remove_empty_lines_action.triggered.connect(self.remove_empty_lines)
+        edit_menu.addAction(remove_empty_lines_action)
+
+        toggle_comment_action = QAction("Toggle Comment", self)
+        toggle_comment_action.setShortcut("Ctrl+/")
+        toggle_comment_action.triggered.connect(self.toggle_comment)
+        edit_menu.addAction(toggle_comment_action)
+        
         edit_menu.addSeparator()
         
         # Bookmark actions
@@ -2924,6 +2845,27 @@ class MainWindow(QMainWindow):
         fragment_editor_action.setShortcut("F8")
         fragment_editor_action.triggered.connect(self.open_fragment_editor)
         edit_menu.addAction(fragment_editor_action)
+        
+        edit_menu.addSeparator()
+
+        # Select Node actions
+        select_node_action = QAction("Select XML Node", self)
+        select_node_action.setShortcut("Shift+F4")
+        select_node_action.setToolTip("Select entire XML node near cursor (tags + content)")
+        select_node_action.triggered.connect(lambda: self.select_xml_node_or_parent(exclude_border_tags=False))
+        edit_menu.addAction(select_node_action)
+
+        select_content_action = QAction("Select XML Content", self)
+        select_content_action.setShortcut("F4")
+        select_content_action.setToolTip("Select content inside XML tags near cursor")
+        select_content_action.triggered.connect(lambda: self.select_xml_node_or_parent(exclude_border_tags=True))
+        edit_menu.addAction(select_content_action)
+
+        move_selection_action = QAction("Move Selection to New Tab with Link", self)
+        move_selection_action.setShortcut("F6")
+        move_selection_action.setToolTip("Move selected text to a new tab and replace with a link")
+        move_selection_action.triggered.connect(self.move_selection_to_new_tab_with_link)
+        edit_menu.addAction(move_selection_action)
         
         # XML menu
         xml_menu = menubar.addMenu("XML")
@@ -3361,6 +3303,32 @@ class MainWindow(QMainWindow):
         self.toggle_line_numbers_action.toggled.connect(_on_line_numbers_toggled)
         view_menu.addAction(self.toggle_line_numbers_action)
         
+        # Toggle Code Folding
+        self.toggle_code_folding_action = QAction("Enable Code Folding", self)
+        self.toggle_code_folding_action.setCheckable(True)
+        self.toggle_code_folding_action.setChecked(True)  # Default: on
+        
+        def _on_code_folding_toggled(checked: bool):
+            try:
+                # Apply to current editor
+                if hasattr(self, 'xml_editor') and self.xml_editor:
+                    self.xml_editor.set_code_folding_enabled(checked)
+                
+                # Update status
+                if hasattr(self, 'status_label') and self.status_label:
+                    self.status_label.setText(f"Code folding {'enabled' if checked else 'disabled'}")
+                
+                # Persist flag
+                try:
+                    self._save_flag('code_folding', checked)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Code folding toggle error: {e}")
+        
+        self.toggle_code_folding_action.toggled.connect(_on_code_folding_toggled)
+        view_menu.addAction(self.toggle_code_folding_action)
+        
         view_menu.addSeparator()
         
         # Code Folding actions
@@ -3382,12 +3350,12 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         
         nav_up_action = QAction("Navigate Tree Up", self)
-        nav_up_action.setShortcut("F6")
+        nav_up_action.setShortcut("Ctrl+Up")
         nav_up_action.triggered.connect(lambda: self.xml_tree.navigate_node_up() if hasattr(self, 'xml_tree') else None)
         view_menu.addAction(nav_up_action)
         
         nav_down_action = QAction("Navigate Tree Down", self)
-        nav_down_action.setShortcut("F7")
+        nav_down_action.setShortcut("Ctrl+Down")
         nav_down_action.triggered.connect(lambda: self.xml_tree.navigate_node_down() if hasattr(self, 'xml_tree') else None)
         view_menu.addAction(nav_down_action)
 
@@ -3474,7 +3442,7 @@ class MainWindow(QMainWindow):
         
         # Rebuild Tree button with auto-close tags
         rebuild_tree_btn = QAction("Rebuild Tree", self)
-        rebuild_tree_btn.setShortcut("F11")
+        rebuild_tree_btn.setShortcut("F5")
         rebuild_tree_btn.setToolTip("Rebuild tree from editor content with auto-close unclosed tags")
         rebuild_tree_btn.triggered.connect(self.rebuild_tree_with_autoclose)
         toolbar.addAction(rebuild_tree_btn)
@@ -3505,8 +3473,10 @@ class MainWindow(QMainWindow):
                 pass
             if checked:
                 try:
-                    cursor = self.xml_editor.textCursor()
-                    current_line = cursor.blockNumber() + 1
+                    current_line = 0
+                    line, _ = self.xml_editor.getCursorPosition()
+                    current_line = line + 1
+
                     # Update main tree
                     self._sync_tree_to_cursor(current_line)
                     # Compute path for multicolumn windows and propagate
@@ -3537,9 +3507,21 @@ class MainWindow(QMainWindow):
             # Update button state
             self._update_button_state('symbols', checked)
             
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
-                # Update highlighter visibility option for symbols
-                self.xml_editor.highlighter.set_visibility_options(hide_symbols=checked)
+            if hasattr(self, 'xml_editor'):
+                if hasattr(self.xml_editor, 'set_visibility_options'):
+                    # Update visibility via QScintilla method
+                    # We need to get current states of other flags
+                    hide_tgs = self._read_flag('hide_tags', False)
+                    hide_vals = self._read_flag('hide_values', False)
+                    self.xml_editor.set_visibility_options(
+                        hide_symbols=checked,
+                        hide_tags=hide_tgs,
+                        hide_values=hide_vals
+                    )
+                elif hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
+                    # Legacy update highlighter visibility option for symbols
+                    self.xml_editor.highlighter.set_visibility_options(hide_symbols=checked)
+                
                 # Reflect state in status bar for clarity
                 if hasattr(self, 'status_label') and self.status_label:
                     self.status_label.setText(f"<> symbols {'hidden' if checked else 'visible'}")
@@ -3567,9 +3549,20 @@ class MainWindow(QMainWindow):
             # Update button state
             self._update_button_state('tags', checked)
             
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
-                # Update highlighter visibility option for tags
-                self.xml_editor.highlighter.set_visibility_options(hide_tags=checked)
+            if hasattr(self, 'xml_editor'):
+                if hasattr(self.xml_editor, 'set_visibility_options'):
+                    # Update visibility via QScintilla method
+                    hide_syms = self._read_flag('hide_symbols', False)
+                    hide_vals = self._read_flag('hide_values', False)
+                    self.xml_editor.set_visibility_options(
+                        hide_symbols=hide_syms,
+                        hide_tags=checked,
+                        hide_values=hide_vals
+                    )
+                elif hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
+                    # Legacy update highlighter visibility option for tags
+                    self.xml_editor.highlighter.set_visibility_options(hide_tags=checked)
+
                 # Reflect state in status bar for clarity
                 if hasattr(self, 'status_label') and self.status_label:
                     self.status_label.setText(f"Tags {'hidden' if checked else 'visible'}")
@@ -3597,9 +3590,20 @@ class MainWindow(QMainWindow):
             # Update button state
             self._update_button_state('values', checked)
             
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
-                # Update highlighter visibility option for values
-                self.xml_editor.highlighter.set_visibility_options(hide_values=checked)
+            if hasattr(self, 'xml_editor'):
+                if hasattr(self.xml_editor, 'set_visibility_options'):
+                    # Update visibility via QScintilla method
+                    hide_syms = self._read_flag('hide_symbols', False)
+                    hide_tgs = self._read_flag('hide_tags', False)
+                    self.xml_editor.set_visibility_options(
+                        hide_symbols=hide_syms,
+                        hide_tags=hide_tgs,
+                        hide_values=checked
+                    )
+                elif hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
+                    # Legacy update highlighter visibility option for values
+                    self.xml_editor.highlighter.set_visibility_options(hide_values=checked)
+
                 # Reflect state in status bar for clarity
                 if hasattr(self, 'status_label') and self.status_label:
                     self.status_label.setText(f"Values {'hidden' if checked else 'visible'}")
@@ -3788,6 +3792,103 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Default language install error: {e}")
 
+    def handle_definition_lookup(self, content):
+        """Handle definition lookup request from editor (Ctrl+Click on quoted text)"""
+        try:
+            target_type = None
+            target_name = None
+            
+            if content.startswith("Запросы."):
+                target_type = "Запрос"
+                target_name = content.split(".", 1)[1]
+            elif content.startswith("Алгоритмы."):
+                target_type = "Алгоритм"
+                target_name = content.split(".", 1)[1]
+            
+            if not target_type or not target_name:
+                return
+
+            editor_content = self.xml_editor.get_content()
+            
+            # Find the tag with the given name attribute
+            # We look for <Type ... Имя="Name" ...>
+            # Use regex for robustness against attribute order and whitespace
+            pattern = f'<{target_type}[^>]*Имя="{re.escape(target_name)}"[^>]*>'
+            match = re.search(pattern, editor_content)
+            
+            if not match:
+                self.status_bar.showMessage(f"Definition not found: {content}", 3000)
+                return
+            
+            start_pos = match.end()
+            
+            # Find the closing tag
+            # We need to handle nested tags of same type if any (unlikely for top-level definitions but possible)
+            # A simple search for </Type> after start_pos might be enough if we assume well-formedness
+            # But better to use a balanced finder if possible.
+            # For now, let's try simple search for closing tag.
+            closing_tag = f"</{target_type}>"
+            end_pos = editor_content.find(closing_tag, start_pos)
+            
+            if end_pos == -1:
+                self.status_bar.showMessage(f"Closing tag for {content} not found", 3000)
+                return
+            
+            # Extract content (excluding the tag itself)
+            fragment_text = editor_content[start_pos:end_pos]
+            
+            # Remove leading newline if present (optional, but cleaner)
+            if fragment_text.startswith('\n'):
+                fragment_text = fragment_text[1:]
+            
+            # Open in fragment editor
+            # We pass 'XML' as language (or maybe 1C Internal if supported)
+            dlg = FragmentEditorDialog(fragment_text, self.language_registry, initial_language='XML', parent=self)
+            
+            # If user saves, we need to update the original document
+            # This is tricky because we need to replace the exact range.
+            # We can use a callback.
+            
+            def on_save(new_text):
+                # Replace the range in the editor
+                # We need to convert byte offsets (start_pos, end_pos) to line/index if using QScintilla API
+                # Or just use setText but that replaces everything.
+                # Better: use byte offsets if we are sure content hasn't changed.
+                # If content changed, we are in trouble.
+                # But dialog is modal? No, it's non-modal usually?
+                # FragmentEditorDialog inherits QDialog, so exec() makes it modal.
+                
+                # Check if content changed in background
+                current_content = self.xml_editor.get_content()
+                current_match = re.search(pattern, current_content)
+                if not current_match:
+                    QMessageBox.warning(self, "Error", "Original definition not found (file changed?)")
+                    return
+                
+                current_start = current_match.end()
+                current_end = current_content.find(closing_tag, current_start)
+                
+                if current_end == -1:
+                    QMessageBox.warning(self, "Error", "Closing tag not found (file changed?)")
+                    return
+                
+                # Construct new content
+                new_full_content = current_content[:current_start] + ("\n" if not new_text.startswith('\n') else "") + new_text + current_content[current_end:]
+                
+                # Set text and preserve cursor if possible
+                line, index = self.xml_editor.getCursorPosition()
+                self.xml_editor.set_content(new_full_content)
+                self.xml_editor.setCursorPosition(line, index)
+                
+                self.status_bar.showMessage(f"Updated definition for {content}", 3000)
+
+            dlg.save_requested.connect(on_save)
+            dlg.exec()
+
+        except Exception as e:
+            print(f"Definition lookup error: {e}")
+            self.status_bar.showMessage(f"Error opening definition: {str(e)}", 3000)
+
     def open_fragment_editor(self):
         """Open selected text in fragment editor."""
         try:
@@ -3795,18 +3896,20 @@ class MainWindow(QMainWindow):
             if not editor:
                 return
             
-            cursor = editor.textCursor()
-            if not cursor.hasSelection():
-                # If no selection, check if we can select the current element using F4 logic?
-                # Or just show message.
+            update_target = None
+            text = ""
+            
+            if not editor.hasSelectedText():
                 QMessageBox.information(self, "Fragment Editor", "Please select XML fragment to edit.")
                 return
-
-            text = cursor.selectedText()
-            # Replace unicode paragraph separator which Qt might introduce for newlines
-            text = text.replace('\u2029', '\n') 
+            text = editor.selectedText()
+            update_target = editor
             
             dialog = FragmentEditorDialog(text, self.language_registry, parent=self)
+            
+            # Connect save signal to update the main editor
+            dialog.save_requested.connect(lambda new_text: self._update_fragment_in_editor(update_target, new_text))
+            
             dialog.setWindowFlags(Qt.WindowType.Window)  # Make it a non-modal window
             dialog.show()  # Show non-modal dialog
             
@@ -3820,75 +3923,21 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Fragment editor error: {e}")
 
+    def _update_fragment_in_editor(self, target, new_text: str):
+        """Update the fragment in the main editor with new text."""
+        try:
+            target.replaceSelectedText(new_text)
+            if hasattr(self, 'status_bar') and self.status_bar:
+                self.status_bar.showMessage("Fragment updated in main document", 3000)
+                
+        except Exception as e:
+            print(f"Error updating fragment: {e}")
+            QMessageBox.warning(self, "Update Error", f"Failed to update fragment: {e}")
+
     def _apply_selected_language_to_editor(self, editor: 'XmlEditorWidget'):
         """Apply the currently selected language profile to the given editor."""
-        try:
-            # Check if highlighting is enabled (Spartan Mode check)
-            highlight_enabled = True
-            if hasattr(self, 'toggle_highlight_action'):
-                highlight_enabled = self.toggle_highlight_action.isChecked()
-            
-            # Control occurrence highlighting based on master highlight switch
-            if hasattr(editor, 'enable_occurrence_highlighting'):
-                editor.enable_occurrence_highlighting = highlight_enabled
-                # If disabled, clear any existing extra selections (highlights)
-                if not highlight_enabled:
-                    editor.setExtraSelections([])
-            
-            if not highlight_enabled:
-                # Disable highlighting
-                if hasattr(editor, 'highlighter') and editor.highlighter:
-                    editor.highlighter.setDocument(None)
-                    editor.highlighter = None
-                return
-
-            # Determine selection (fall back to XML)
-            selected = 'XML'
-            try:
-                if hasattr(self, 'language_combo') and self.language_combo:
-                    idx = self.language_combo.currentIndex()
-                    if idx >= 0:
-                        selected = self.language_combo.itemText(idx) or 'XML'
-            except Exception:
-                pass
-
-            if selected == 'XML':
-                # Use built-in XML highlighter
-                try:
-                    editor.highlighter = XmlHighlighter(editor.document())
-                except Exception as e:
-                    print(f"XML highlighter init error: {e}")
-            else:
-                # Use rule-based highlighter compiled from the language registry
-                try:
-                    ld = self.language_registry.get(selected)
-                    if ld is None:
-                        # Fallback to XML if language not found
-                        editor.highlighter = XmlHighlighter(editor.document())
-                    else:
-                        rules = LanguageProfileCompiler(ld).compile()
-                        editor.highlighter = RuleHighlighter(editor.document(), rules)
-                except Exception as e:
-                    print(f"Rule highlighter init error: {e}")
-                    try:
-                        editor.highlighter = XmlHighlighter(editor.document())
-                    except Exception:
-                        pass
-
-            # Align theme on the new highlighter
-            try:
-                # Detect current theme from persisted flag
-                s = self._get_settings()
-                is_dark = s.value("flags/dark_theme")
-                if isinstance(is_dark, str):
-                    is_dark = is_dark.lower() in ("1", "true", "yes", "on")
-                elif not isinstance(is_dark, bool):
-                    is_dark = True
-                editor.highlighter.set_dark_theme(bool(is_dark))
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"Apply language error: {e}")                
+        # TODO: Implement language switching for QScintilla (currently only XML is supported)
+        pass                
 
     def cycle_syntax_language(self):
         """Cycle to the next available syntax language."""
@@ -3928,15 +3977,18 @@ class MainWindow(QMainWindow):
     def _apply_highlighter_settings(self):
         """Apply saved highlighter visibility settings after opening a file."""
         try:
-            if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter') and self.xml_editor.highlighter:
+            if hasattr(self, 'xml_editor') and self.xml_editor:
                 hide_syms = self._read_flag('hide_symbols', False)
                 hide_tgs = self._read_flag('hide_tags', False)
                 hide_vals = self._read_flag('hide_values', False)
-                self.xml_editor.highlighter.set_visibility_options(
-                    hide_symbols=hide_syms,
-                    hide_tags=hide_tgs,
-                    hide_values=hide_vals
-                )
+                
+                # Use QScintilla method if available
+                if hasattr(self.xml_editor, 'set_visibility_options'):
+                    self.xml_editor.set_visibility_options(
+                        hide_symbols=hide_syms,
+                        hide_tags=hide_tgs,
+                        hide_values=hide_vals
+                    )
         except Exception as e:
             print(f"Error applying highlighter settings: {e}")
     
@@ -4070,6 +4122,7 @@ class MainWindow(QMainWindow):
             # Connect delete/hide signals
             self.xml_tree.delete_node_requested.connect(self.delete_xml_node)
             self.xml_tree.hide_node_requested.connect(self.hide_xml_node)
+            self.xml_tree.tree_built.connect(self._on_tree_built)
         except Exception:
             pass
         
@@ -4136,6 +4189,11 @@ class MainWindow(QMainWindow):
 
         # Dockable bottom panel (hidden by default)
         self.bottom_panel = BottomPanel()
+        
+        # Connect Favorites navigation signal
+        if hasattr(self.bottom_panel, 'favorites_widget'):
+            self.bottom_panel.favorites_widget.navigate_requested.connect(self.goto_line)
+            
         self.bottom_dock = QDockWidget("", self)  # Empty title to save vertical space
         self.bottom_dock.setObjectName("BottomPanelDock")
         self.bottom_dock.setWidget(self.bottom_panel)
@@ -4357,6 +4415,30 @@ class MainWindow(QMainWindow):
                         editor.set_line_numbers_visible(visible)
         except Exception as e:
             print(f"Error applying line numbers: {e}")
+            
+    def apply_font_settings(self, family: str, size: int):
+        """Apply font settings to all open editors and output panel"""
+        try:
+            font = QFont(family, size)
+            
+            # Apply to all open editors
+            if hasattr(self, 'tab_widget'):
+                for i in range(self.tab_widget.count()):
+                    editor = self.tab_widget.widget(i)
+                    if isinstance(editor, XmlEditorWidget):
+                        editor.setFont(font)
+                        editor.setMarginsFont(font)
+                        # Re-configure lexer to apply font
+                        if editor.lexer():
+                            editor.lexer().setDefaultFont(font)
+                            editor.lexer().setFont(font)
+            
+            # Apply to output tab
+            if hasattr(self, 'bottom_panel') and hasattr(self.bottom_panel, 'output_text'):
+                self.bottom_panel.output_text.setFont(font)
+                self.bottom_panel.output_text.setMarginsFont(font)
+        except Exception as e:
+            print(f"Error applying font settings: {e}")
     
     def _save_flag(self, key: str, value: bool):
         try:
@@ -4487,6 +4569,20 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'xml_tree') and self.xml_tree:
                 self.xml_tree.use_friendly_labels = val
                 self.xml_tree.refresh_labels()
+            # Update button state
+            self._update_button_state('friendly', val)
+            
+        # Code Folding
+        if hasattr(self, 'toggle_code_folding_action'):
+            val = self._read_flag('code_folding', True)
+            try:
+                self.toggle_code_folding_action.blockSignals(True)
+                self.toggle_code_folding_action.setChecked(val)
+                self.toggle_code_folding_action.blockSignals(False)
+            except Exception:
+                pass
+            if hasattr(self, 'xml_editor') and self.xml_editor:
+                self.xml_editor.set_code_folding_enabled(val)
         # Show tree header preference
         show_tree_header = self._read_flag('show_tree_header', True)  # Default: show
         if not show_tree_header:
@@ -4563,6 +4659,8 @@ class MainWindow(QMainWindow):
                 pass
             if hasattr(self, 'xml_tree') and self.xml_tree:
                 self.xml_tree.set_hide_leaves(val)
+            # Update button state
+            self._update_button_state('leaves', val)
         # Breadcrumbs
         if hasattr(self, 'toggle_breadcrumb_action'):
             val = self._read_flag('show_breadcrumbs', False)
@@ -4709,9 +4807,10 @@ class MainWindow(QMainWindow):
         try:
             is_dark = self._read_flag('dark_theme', True)
             if is_dark:
-                self.set_dark_theme()
+                # Use QTimer to ensure UI is ready before applying theme
+                QTimer.singleShot(0, self.set_dark_theme)
             else:
-                self.set_light_theme()
+                QTimer.singleShot(0, self.set_light_theme)
         except Exception:
             pass
 
@@ -5016,6 +5115,13 @@ class MainWindow(QMainWindow):
                 self._apply_selected_language_to_editor(self.xml_editor)
             except Exception:
                 pass
+            
+            # Sync code folding action state
+            if hasattr(self, 'toggle_code_folding_action'):
+                was_blocked = self.toggle_code_folding_action.blockSignals(True)
+                self.toggle_code_folding_action.setChecked(self.xml_editor.line_number_widget.folding_enabled)
+                self.toggle_code_folding_action.blockSignals(was_blocked)
+
             # Update tree if toggle enabled
             if getattr(self, 'update_tree_on_tab_switch', True):
                 content = self.xml_editor.get_content()
@@ -5051,6 +5157,15 @@ class MainWindow(QMainWindow):
     def _close_tab(self, index: int):
         """Close tab and clean up references"""
         widget = self.tab_widget.widget(index)
+        
+        # Capture state before closing
+        if isinstance(widget, XmlEditorWidget):
+            self._capture_editor_state(widget)
+            # Save to disk to ensure state is persisted even if app crashes later
+            # We defer saving slightly to avoid lag on close, or just save now.
+            # Saving now is safer.
+            QTimer.singleShot(0, self._save_file_states)
+
         self.tab_widget.removeTab(index)
         # If closing active tab, _on_tab_changed will update reference; ensure we have at least one tab
         if self.tab_widget.count() == 0:
@@ -5062,6 +5177,10 @@ class MainWindow(QMainWindow):
             show_line_numbers = self._read_flag('show_line_numbers', False)
             new_editor.set_line_numbers_visible(show_line_numbers)
             
+            # Apply code folding setting
+            code_folding = self._read_flag('code_folding', True)
+            new_editor.set_code_folding_enabled(code_folding)
+            
             self.tab_widget.addTab(new_editor, "Document")
             self.xml_editor = new_editor
             self._connect_signals()
@@ -5070,12 +5189,20 @@ class MainWindow(QMainWindow):
         """Create a new editor tab with given title and content, return editor and index"""
         editor = XmlEditorWidget()
         editor.fragment_editor_requested.connect(self.open_fragment_editor)
+        editor.definition_lookup_requested.connect(self.handle_definition_lookup)
         editor.modification_changed.connect(self._on_editor_modification_changed)
         editor.set_content(content)
         
         # Apply line numbers setting
         show_line_numbers = self._read_flag('show_line_numbers', False)
         editor.set_line_numbers_visible(show_line_numbers)
+        
+        # Apply code folding setting
+        code_folding = self._read_flag('code_folding', True)
+        editor.set_code_folding_enabled(code_folding)
+        
+        if code_folding:
+            self.auto_fold_special_tags(editor)
         
         index = self.tab_widget.addTab(editor, title)
         # Switch to the new tab
@@ -5092,9 +5219,9 @@ class MainWindow(QMainWindow):
         """Find the smallest enclosing XML element range at the cursor and return (start_line, end_line)."""
         try:
             editor = self.xml_editor
-            text = editor.get_content()
-            cur = editor.textCursor()
-            pos = cur.position()
+            text = editor.text()
+            pos = editor.get_cursor_char_position()
+
             ranges = self._compute_enclosing_xml_ranges(text)
             if not ranges:
                 return None
@@ -5103,14 +5230,11 @@ class MainWindow(QMainWindow):
                 return None
             target = sorted(containing, key=lambda r: (r[2] - r[1]))[0]
             start_pos, end_pos = target[1], target[2]
+            
             # Map positions to 1-based line numbers
-            lines = text.split('\n')
-            def _pos_to_line(p):
-                # Count '\n' up to position
-                cnt = text[:p].count('\n') + 1
-                return cnt
-            start_line = _pos_to_line(start_pos)
-            end_line = _pos_to_line(end_pos)
+            start_line = text.count('\n', 0, start_pos) + 1
+            end_line = text.count('\n', 0, end_pos) + 1
+            
             return (start_line, end_line)
         except Exception as e:
             print(f"Range-at-cursor error: {e}")
@@ -5154,9 +5278,8 @@ class MainWindow(QMainWindow):
         """
         try:
             editor = self.xml_editor
-            text = editor.get_content()
-            cursor = editor.textCursor()
-            pos = cursor.position()
+            text = editor.text()
+            pos = editor.get_cursor_char_position()
             
             # Get all enclosing ranges
             ranges = self._compute_enclosing_xml_ranges(text)
@@ -5185,9 +5308,12 @@ class MainWindow(QMainWindow):
                         break
             
             if target_pos is not None:
-                new_cursor = QTextCursor(editor.document())
-                new_cursor.setPosition(target_pos)
-                editor.setTextCursor(new_cursor)
+                # Convert char offset to byte offset for QScintilla
+                # Reuse 'text' which is already fetched
+                byte_offset = len(text[:target_pos].encode('utf-8'))
+                editor.SendScintilla(QsciScintilla.SCI_GOTOPOS, byte_offset)
+                editor.ensureCursorVisible()
+                    
                 if hasattr(self, 'status_label') and self.status_label:
                     self.status_label.setText(f"Jumped to position {target_pos}")
                 
@@ -5254,14 +5380,13 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(f"No elements found at level {level}")
                 return
 
-            doc = self.xml_editor.document()
-            count = 0
             lines_ranges = []
+            count = 0
             
+            content = self.xml_editor.text()
             for start_idx, end_idx in ranges_to_fold:
-                # Map char position to block number (0-based) -> line number (1-based)
-                start_line = doc.findBlock(start_idx).blockNumber() + 1
-                end_line = doc.findBlock(end_idx).blockNumber() + 1
+                start_line = content.count('\n', 0, start_idx) + 1
+                end_line = content.count('\n', 0, end_idx) + 1
                 
                 if start_line < end_line:
                     lines_ranges.append((start_line, end_line))
@@ -5350,6 +5475,36 @@ class MainWindow(QMainWindow):
             print(f"Error hiding tree panel: {e}")
 
     # --- F4/F5 helpers ---
+    def auto_fold_special_tags(self, editor=None):
+        """Automatically fold specific tags like <ПослеЗагрузки...>"""
+        try:
+            if not editor:
+                editor = self.xml_editor
+            
+            # Check if folding is enabled
+            if not editor.line_number_widget.folding_enabled:
+                return
+
+            content = editor.get_content()
+            ranges = self._compute_enclosing_xml_ranges(content)
+            
+            ranges_to_fold = []
+            for tag, start, end in ranges:
+                if tag.startswith("ПослеЗагрузки") or tag.startswith("АлгоритмПослеЗагрузки"):
+                    # Convert to lines
+                    start_line = content[:start].count('\n') + 1
+                    end_line = content[:end].count('\n') + 1
+                    # Only fold if it spans multiple lines
+                    if start_line < end_line:
+                        ranges_to_fold.append((start_line, end_line))
+            
+            if ranges_to_fold:
+                editor.fold_multiple_lines(ranges_to_fold)
+                if hasattr(self, 'status_label') and self.status_label:
+                    self.status_label.setText(f"Auto-folded {len(ranges_to_fold)} special blocks")
+        except Exception as e:
+            print(f"Auto-fold error: {e}")
+
     def _compute_enclosing_xml_ranges(self, text: str):
         """Compute element ranges using a simple stack-based parser. Returns list of (tag, start, end)."""
         ranges = []
@@ -5357,13 +5512,19 @@ class MainWindow(QMainWindow):
         # Handle comments and CDATA and PIs by temporarily removing them to avoid mis-parsing
         # Record their spans as atomic ranges too
         comment_pattern = re.compile(r"<!--.*?-->", re.DOTALL)
+        # Regex for C++ style line comments (//) - match contiguous blocks
+        # Match start of line, optional whitespace, //, rest of line, and the newline
+        line_comment_pattern = re.compile(r"(?:^\s*//.*(?:\r?\n|$))+", re.MULTILINE)
         cdata_pattern = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
         pi_pattern = re.compile(r"<\?.*?\?>", re.DOTALL)
         doctype_pattern = re.compile(r"<!DOCTYPE.*?>", re.DOTALL)
         special_spans = []
-        for pat in (comment_pattern, cdata_pattern, pi_pattern, doctype_pattern):
+        for pat in (comment_pattern, line_comment_pattern, cdata_pattern, pi_pattern, doctype_pattern):
             for m in pat.finditer(text):
-                special_spans.append(("special", m.start(), m.end()))
+                # For line comments, we only want to fold if it's more than one line or manually requested
+                # But for now, let's treat any block as a range.
+                # Use "comment" tag so it might be styled or treated as comment
+                special_spans.append(("comment", m.start(), m.end()))
         # Support Unicode tag names (including Cyrillic), namespaces, and punctuation
         # Tag name: one or more non-space, non-'>' and non'/' characters
         tag_pattern = re.compile(r"<(/?)([^\s>/]+)([^>]*)>", re.UNICODE)
@@ -5407,24 +5568,22 @@ class MainWindow(QMainWindow):
             return None
             
         editor = self.xml_editor
-        text = editor.get_content()
+        text = editor.text()
+
         ranges = self._compute_enclosing_xml_ranges(text)
         
         # Find range that starts at the node's line
-        doc = editor.document()
         # node.line_number is 1-based
-        try:
-            target_block_num = node.line_number - 1
-            if target_block_num < 0 or target_block_num >= doc.blockCount():
-                return None
-        except Exception:
-            return None
-            
+        target_line_idx = node.line_number - 1
+        
         candidates = []
+        
         for r in ranges:
             tag, start, end = r
-            r_block = doc.findBlock(start)
-            if r_block.blockNumber() == target_block_num:
+            # Map char start position to line index
+            # Optimization: use count which is fast in C-implemented python strings
+            line_idx = text.count('\n', 0, start)
+            if line_idx == target_line_idx:
                 candidates.append(r)
         
         if not candidates:
@@ -5437,6 +5596,22 @@ class MainWindow(QMainWindow):
         
         return (candidates[0][1], candidates[0][2])
 
+    def _set_selection_range(self, start, end):
+        """Helper to set selection range for both QScintilla and QTextEdit"""
+        text = self.xml_editor.text()
+         
+        # Start
+        start_line = text.count('\n', 0, start)
+        last_nl_start = text.rfind('\n', 0, start)
+        start_index = start if last_nl_start == -1 else start - last_nl_start - 1
+         
+        # End
+        end_line = text.count('\n', 0, end)
+        last_nl_end = text.rfind('\n', 0, end)
+        end_index = end if last_nl_end == -1 else end - last_nl_end - 1
+         
+        self.xml_editor.setSelection(start_line, start_index, end_line, end_index)
+
     def delete_xml_node(self, node):
         """Delete the XML block corresponding to the node"""
         try:
@@ -5446,10 +5621,9 @@ class MainWindow(QMainWindow):
                 return
                 
             start, end = r
-            cursor = self.xml_editor.textCursor()
-            cursor.setPosition(start)
-            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-            cursor.removeSelectedText()
+            self._set_selection_range(start, end)
+            
+            self.xml_editor.replaceSelectedText("")
             
             # Rebuild tree
             self.rebuild_tree_with_autoclose()
@@ -5467,18 +5641,21 @@ class MainWindow(QMainWindow):
                 return
                 
             start, end = r
-            editor = self.xml_editor
-            text = editor.get_content()
+            
+            # Check content
+            text = self.xml_editor.text()
+                 
             selected_text = text[start:end]
             
             if "-->" in selected_text:
                  QMessageBox.warning(self, "Hide Error", "Cannot comment out block containing '-->'.")
                  return
     
-            cursor = editor.textCursor()
-            cursor.setPosition(start)
-            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-            cursor.insertText(f"<!-- {selected_text} -->")
+            self._set_selection_range(start, end)
+            
+            new_text = f"<!-- {selected_text} -->"
+            
+            self.xml_editor.replaceSelectedText(new_text)
             
             # Rebuild tree
             self.rebuild_tree_with_autoclose()
@@ -5508,14 +5685,38 @@ class MainWindow(QMainWindow):
              return content_end, content_end
         return content_start, content_end
 
+    def _get_selection_char_offsets(self, editor):
+        """Helper to get selection character offsets for both QScintilla and QTextEdit"""
+        if not editor.hasSelectedText():
+             return None, None
+        
+        # getSelection() -> (lineFrom, indexFrom, lineTo, indexTo)
+        lf, if_, lt, it = editor.getSelection()
+        
+        # Helper to convert line/index to char offset
+        def pos_from_line_index(line, index):
+            pos = 0
+            for i in range(line):
+                 pos += len(editor.text(i))
+            pos += index
+            return pos
+        
+        start = pos_from_line_index(lf, if_)
+        end = pos_from_line_index(lt, it)
+        
+        if start > end:
+            start, end = end, start
+        return start, end
+
     def select_xml_node_or_parent(self, exclude_border_tags=False):
         """Select XML node at cursor; repeated presses select parent element.
            If exclude_border_tags is True, selects only the content inside tags.
         """
         editor = self.xml_editor
-        text = editor.get_content()
-        cursor = editor.textCursor()
-        pos = cursor.position()
+        text = editor.text()
+        pos = editor.get_cursor_char_position()
+
+
         # Compute containing ranges at cursor and sort deepest->root
         ranges = self._compute_enclosing_xml_ranges(text)
         containing_sorted = sorted([r for r in ranges if r[1] <= pos <= r[2]], key=lambda r: (r[2] - r[1]))
@@ -5532,29 +5733,33 @@ class MainWindow(QMainWindow):
                 if exclude_border_tags:
                     start, end = self._get_inner_xml_range(text, start, end)
 
-                new_cursor = editor.textCursor()
-                new_cursor.setPosition(start)
-                new_cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-                editor.setTextCursor(new_cursor)
+                self._set_selection_range(start, end)
+                
                 # Sync tree to the newly selected element
                 try:
-                    line = editor.textCursor().blockNumber() + 1
+                    line, _ = editor.getCursorPosition()
+                    line += 1
                     self._sync_tree_to_cursor(line)
                 except Exception:
                     pass
                 return
+            
             # If no ranges at all (empty/invalid XML), fall back to line selection
-            cursor.select(QTextCursor.SelectionType.LineUnderCursor)
-            editor.setTextCursor(cursor)
+            line, _ = editor.getCursorPosition()
+            # Select line
+            # QScintilla doesn't have SelectLine? 
+            # We can calculate line start/end or use setSelection with line + 1
+            # Using setSelection(line, 0, line + 1, 0)
+            editor.setSelection(line, 0, line + 1, 0)
             return
         
         target = None
-        if not cursor.hasSelection():
+        sel_start, sel_end = self._get_selection_char_offsets(editor)
+        
+        if sel_start is None:
             # First press: select deepest element
             target = containing_sorted[0]
         else:
-            sel_start = min(cursor.anchor(), cursor.position())
-            sel_end = max(cursor.anchor(), cursor.position())
             # Find current selection in the chain
             idx = next((i for i, r in enumerate(containing_sorted) if r[1] == sel_start and r[2] == sel_end), None)
             
@@ -5586,13 +5791,12 @@ class MainWindow(QMainWindow):
         if exclude_border_tags:
             start, end = self._get_inner_xml_range(text, start, end)
 
-        new_cursor = editor.textCursor()
-        new_cursor.setPosition(start)
-        new_cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-        editor.setTextCursor(new_cursor)
+        self._set_selection_range(start, end)
+        
         # Sync tree to the newly selected element
         try:
-            line = editor.textCursor().blockNumber() + 1
+            line, _ = editor.getCursorPosition()
+            line += 1
             self._sync_tree_to_cursor(line)
         except Exception:
             pass
@@ -5600,17 +5804,19 @@ class MainWindow(QMainWindow):
     def move_selection_to_new_tab_with_link(self):
         """Move selected text to a new tab and leave a link comment in place."""
         editor = self.xml_editor
-        cursor = editor.textCursor()
-        if not cursor.hasSelection():
+        sel_start, sel_end = self._get_selection_char_offsets(editor)
+        
+        if sel_start is None:
             # If nothing selected, select element under cursor
             self.select_xml_node_or_parent()
-            cursor = editor.textCursor()
-            if not cursor.hasSelection():
+            sel_start, sel_end = self._get_selection_char_offsets(editor)
+            if sel_start is None:
                 return
-        start = min(cursor.anchor(), cursor.position())
-        end = max(cursor.anchor(), cursor.position())
-        text = editor.get_content()
-        selected_text = text[start:end]
+                
+        text = editor.text()
+             
+        selected_text = text[sel_start:sel_end]
+        
         # Create new tab
         if not hasattr(self, 'tab_link_counter'):
             self.tab_link_counter = 1
@@ -5624,14 +5830,15 @@ class MainWindow(QMainWindow):
         self.tab_link_map[link_id] = sub_editor
         # Replace selection with link comment
         link_comment = f"<!-- TABREF: {link_id} -->"
-        new_cursor = editor.textCursor()
-        new_cursor.setPosition(start)
-        new_cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-        new_cursor.insertText(link_comment)
-        editor.setTextCursor(new_cursor)
+        
+        self._set_selection_range(sel_start, sel_end)
+        
+        editor.replaceSelectedText(link_comment)
+             
         # Optionally update tree if toggle enabled
         if getattr(self, 'update_tree_on_tab_switch', True):
-            self.xml_tree.populate_tree(editor.get_content())
+            self.xml_tree.populate_tree(editor.text())
+                 
         # Status update
         if hasattr(self, 'status_label') and self.status_label:
             self.status_label.setText(f"Moved selection to '{tab_title}', inserted link {link_id}")
@@ -5639,9 +5846,9 @@ class MainWindow(QMainWindow):
     def replace_link_with_tab_content(self):
         """Replace a TABREF comment under cursor with the content from its tab."""
         editor = self.xml_editor
-        text = editor.get_content()
-        cursor = editor.textCursor()
-        pos = cursor.position()
+        text = editor.text()
+        pos = editor.get_cursor_char_position()
+             
         # Find TABREF comment around cursor
         pattern = re.compile(r"<!--\s*TABREF:\s*([A-Za-z0-9_\-]+)\s*-->")
         # Search a window around the cursor to find the comment boundaries
@@ -5649,6 +5856,11 @@ class MainWindow(QMainWindow):
         end_search = min(len(text), pos + 200)
         segment = text[start_search:end_search]
         m = pattern.search(segment)
+        
+        link_id = None
+        abs_start = 0
+        abs_end = 0
+        
         if not m:
             # Try global search
             m2 = pattern.search(text)
@@ -5662,20 +5874,26 @@ class MainWindow(QMainWindow):
             link_id = m.group(1)
             abs_start = start_search + m.start()
             abs_end = start_search + m.end()
+            
+        # Check if cursor is actually inside or near the match?
+        # The logic above prefers local match, but if not found uses global.
+        # This seems intended.
+        
         # Lookup tab content
         if not hasattr(self, 'tab_link_map') or link_id not in self.tab_link_map:
             return
         sub_editor = self.tab_link_map[link_id]
-        sub_content = sub_editor.get_content()
+        sub_content = sub_editor.text()
+             
         # Replace the comment with content
-        new_cursor = editor.textCursor()
-        new_cursor.setPosition(abs_start)
-        new_cursor.setPosition(abs_end, QTextCursor.MoveMode.KeepAnchor)
-        new_cursor.insertText(sub_content)
-        editor.setTextCursor(new_cursor)
+        self._set_selection_range(abs_start, abs_end)
+        
+        editor.replaceSelectedText(sub_content)
+             
         # Optionally update tree
         if getattr(self, 'update_tree_on_tab_switch', True):
-            self.xml_tree.populate_tree(editor.get_content())
+            self.xml_tree.populate_tree(editor.text())
+                 
         if hasattr(self, 'status_label') and self.status_label:
             self.status_label.setText(f"Replaced link {link_id} with tab content")
     
@@ -6091,9 +6309,8 @@ class MainWindow(QMainWindow):
         selected_text = ""
         try:
             if hasattr(self, 'xml_editor') and self.xml_editor:
-                cursor = self.xml_editor.textCursor()
-                if cursor.hasSelection():
-                    selected_text = cursor.selectedText()
+                if self.xml_editor.hasSelectedText():
+                    selected_text = self.xml_editor.selectedText()
         except Exception:
             pass
             
@@ -6180,15 +6397,14 @@ class MainWindow(QMainWindow):
             if not self.last_search_results:
                 return
             # Replace current selection
-            cursor = self.xml_editor.textCursor()
-            if not cursor.hasSelection():
+            if not self.xml_editor.hasSelectedText():
                 # Ensure selection for the current search index
                 self._navigate_to_search_result(self.current_search_index if self.current_search_index >= 0 else 0)
-                cursor = self.xml_editor.textCursor()
-            # Insert replacement
-            cursor.insertText(replace_text)
-            self.xml_editor.setTextCursor(cursor)
+            
+            # Replace logic
+            self.xml_editor.replaceSelectedText(replace_text)
             self.xml_editor.setFocus()
+            
             # Update status
             try:
                 self.status_label.setText("Replaced one occurrence")
@@ -6213,7 +6429,7 @@ class MainWindow(QMainWindow):
             replace_text = params.get('replace', '')
             if not find_text:
                 return
-            content = self.xml_editor.get_content()
+            content = self.xml_editor.text()
             # Determine replacement strategy
             use_regex = params.get('use_regex', False)
             case_sensitive = params.get('case_sensitive', False)
@@ -6251,7 +6467,7 @@ class MainWindow(QMainWindow):
                         new_content, replaced_count = pattern.subn(replace_text, content)
 
             if replaced_count > 0:
-                self.xml_editor.set_content(new_content)
+                self.xml_editor.setText(new_content)
                 try:
                     self.status_label.setText(f"Replaced {replaced_count} occurrence(s)")
                 except Exception:
@@ -6363,7 +6579,7 @@ class MainWindow(QMainWindow):
                     "Ctrl+Shift+C - Copy Current Node with Subnodes",
                     "Ctrl+Shift+N - Open Node in New Window",
                     "Ctrl+E - Export Tree",
-                    "F11 - Rebuild Tree with auto-close tags",
+                    "F5 - Rebuild Tree with auto-close tags",
                     "Shift+F11 - Toggle Update Tree on Tab Switch"
                 ]),
                 ("Code Folding", [
@@ -6374,13 +6590,14 @@ class MainWindow(QMainWindow):
                 ]),
                 ("Navigation & Selection", [
                     "Ctrl+T - Find in Tree (editor)",
-                    "F4 - Select XML node near cursor",
+                    "Shift+F4 - Select XML node near cursor",
+                    "F4 - Select XML content (inner)",
                     "Ctrl+F4 - Select root element",
                     "Ctrl+Alt+F4 - Cycle top-level elements",
-                    "F5 - Move selection to new tab with link",
+                    "F6 - Move selection to new tab with link",
                     "Shift+F5 - Replace link with edited text from separate tab",
-                    "F6 - Navigate Tree Up",
-                    "F7 - Navigate Tree Down",
+                    "Ctrl+Up - Navigate Tree Up",
+                    "Ctrl+Down - Navigate Tree Down",
                     "F8 - Open selected fragment in new window",
                     "Alt+←/→/↑/↓ - Tree-backed navigation",
                     "Ctrl+] - Jump to matching closing tag",
@@ -6512,22 +6729,28 @@ class MainWindow(QMainWindow):
         """Find next occurrence (F3)"""
         # Only check for selection if editor has focus to avoid crashes
         try:
-            if self.xml_editor.hasFocus() and self.xml_editor.textCursor().hasSelection():
-                selected_text = self.xml_editor.textCursor().selectedText()
-                if len(selected_text) > 0:
-                    # Check if selected text is different from current search term
-                    # If it's the same, just move to next occurrence instead of restarting search
-                    current_search_text = self.last_search_params.get('text', '') if self.last_search_params else ''
-                    if selected_text != current_search_text:
-                        # New search term - start fresh search
-                        self.last_search_term = selected_text
-                        self.find_text({
-                            'text': selected_text,
-                            'case_sensitive': False,
-                            'whole_word': False,
-                            'use_regex': False
-                        })
-                        return
+            has_selection = False
+            selected_text = ""
+            
+            if self.xml_editor.hasFocus():
+                has_selection = self.xml_editor.hasSelectedText()
+                if has_selection:
+                    selected_text = self.xml_editor.selectedText()
+            
+            if has_selection and len(selected_text) > 0:
+                # Check if selected text is different from current search term
+                # If it's the same, just move to next occurrence instead of restarting search
+                current_search_text = self.last_search_params.get('text', '') if self.last_search_params else ''
+                if selected_text != current_search_text:
+                    # New search term - start fresh search
+                    self.last_search_term = selected_text
+                    self.find_text({
+                        'text': selected_text,
+                        'case_sensitive': False,
+                        'whole_word': False,
+                        'use_regex': False
+                    })
+                    return
         except Exception as e:
             # If there's any issue checking selection, just continue with existing search
             print(f"Error checking selection in find_next: {e}")
@@ -6561,18 +6784,18 @@ class MainWindow(QMainWindow):
         line_num, col_start, col_end = self.last_search_results[result_index]
         print(f"DEBUG: Navigating to result {result_index}: line {line_num}, col {col_start}-{col_end}")
         
-        # Navigate to the line
-        cursor = self.xml_editor.textCursor()
-        cursor.movePosition(cursor.MoveOperation.Start)
-        cursor.movePosition(cursor.MoveOperation.Down, cursor.MoveMode.MoveAnchor, line_num - 1)
+        line_idx = line_num - 1
+        # QScintilla uses byte offsets for columns
+        # We need to convert character indices to byte offsets
+        # Get the line text first
+        line_text = self.xml_editor.text(line_idx)
         
-        # Move to the column position
-        cursor.movePosition(cursor.MoveOperation.Right, cursor.MoveMode.MoveAnchor, col_start)
+        # Calculate byte offsets
+        byte_start = len(line_text[:col_start].encode('utf-8'))
+        byte_end = len(line_text[:col_end].encode('utf-8'))
         
-        # Select the found text
-        cursor.movePosition(cursor.MoveOperation.Right, cursor.MoveMode.KeepAnchor, col_end - col_start)
-        
-        self.xml_editor.setTextCursor(cursor)
+        self.xml_editor.setSelection(line_idx, byte_start, line_idx, byte_end)
+        self.xml_editor.ensureLineVisible(line_idx)
         self.xml_editor.setFocus()
         
         # Update status
@@ -6580,28 +6803,28 @@ class MainWindow(QMainWindow):
     
     def goto_line(self, line_number: int):
         """Go to specific line"""
-        cursor = self.xml_editor.textCursor()
-        cursor.movePosition(cursor.MoveOperation.Start)
-        cursor.movePosition(cursor.MoveOperation.Down, cursor.MoveMode.MoveAnchor, line_number - 1)
-        self.xml_editor.setTextCursor(cursor)
+        if line_number <= 0:
+            return
+        
+        self.xml_editor.setCursorPosition(line_number - 1, 0)
+        self.xml_editor.ensureCursorVisible()
         self.xml_editor.setFocus()
 
     def goto_line_and_column(self, line_number: int, column: int):
         """Go to specific line and column within the editor."""
-        cursor = self.xml_editor.textCursor()
-        cursor.movePosition(cursor.MoveOperation.Start)
-        cursor.movePosition(cursor.MoveOperation.Down, cursor.MoveMode.MoveAnchor, max(0, line_number - 1))
-        if column and column > 0:
-            cursor.movePosition(cursor.MoveOperation.Right, cursor.MoveMode.MoveAnchor, column)
-        self.xml_editor.setTextCursor(cursor)
+        if line_number <= 0:
+            return
+            
+        self.xml_editor.setCursorPosition(line_number - 1, column if column > 0 else 0)
+        self.xml_editor.ensureCursorVisible()
         self.xml_editor.setFocus()
     
     def find_in_tree(self):
         """Find current line in tree view (Ctrl+T functionality)"""
         try:
             # Get current cursor position
-            cursor = self.xml_editor.textCursor()
-            current_line = cursor.blockNumber() + 1
+            line, _ = self.xml_editor.getCursorPosition()
+            current_line = line + 1
             
             # Check if tree is populated
             if self.xml_tree.topLevelItemCount() == 0:
@@ -6637,6 +6860,35 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Error finding in tree: {str(e)}")
             print(f"Find in tree error: {e}")  # Debug output
     
+    def remove_empty_lines(self):
+        """Remove empty lines from selected text"""
+        editor = self.xml_editor
+        
+        if not editor.hasSelectedText():
+            self.status_label.setText("No text selected")
+            return
+        
+        selected_text = editor.selectedText()
+        
+        if not selected_text:
+            return
+
+        lines = selected_text.split('\n')
+        # Filter out empty lines or lines with only whitespace
+        non_empty_lines = [line for line in lines if line.strip()]
+        
+        # Join with newlines
+        new_text = '\n'.join(non_empty_lines)
+        
+        if new_text == selected_text:
+            self.status_label.setText("No empty lines found in selection")
+            return
+            
+        # Replace
+        editor.replaceSelectedText(new_text)
+        
+        self.status_label.setText("Removed empty lines from selection")
+
     def format_xml(self):
         """Format XML content"""
         content = self.xml_editor.get_content()
@@ -6687,6 +6939,7 @@ class MainWindow(QMainWindow):
                 # Update editor with fixed content
                 if hasattr(self, 'xml_editor'):
                     self.xml_editor.set_content(fixed_content)
+                    self.auto_fold_special_tags()
                 self.status_label.setText("Auto-closed unclosed tags and rebuilt tree")
             else:
                 self.status_label.setText("Rebuilt tree (no unclosed tags found)")
@@ -7396,68 +7649,86 @@ Total size: {stats.total_size} bytes"""
         return None
     
     def _get_element_path_at_line(self, xml_content: str, line_number: int) -> str:
-        """Get the proper XPath of the element at the given line number using XML parsing"""
+        """Get the proper XPath of the element at the given line number using XML parsing with line numbers"""
         self._debug_print(f"DEBUG: _get_element_path_at_line called with line_number={line_number}")
-        try:
-            import xml.etree.ElementTree as ET
-            
-            # Parse the XML content
-            root = ET.fromstring(xml_content)
-            
-            # Find the element at the given line by parsing line by line
-            lines = xml_content.split('\n')
-            self._debug_print(f"DEBUG: Total lines in content: {len(lines)}")
-            
-            if line_number <= 0 or line_number > len(lines):
-                self._debug_print(f"DEBUG: Line number {line_number} out of range")
-                return ""
-            
-            target_line = lines[line_number - 1].strip()
-            self._debug_print(f"DEBUG: Processing line {line_number}: '{target_line}'")
-            
-            # Extract tag name from the target line
-            if not target_line.startswith('<') or target_line.startswith('<!--'):
-                self._debug_print(f"DEBUG: Line is not an opening tag")
-                return ""
-            
-            # Find tag name
-            tag_end = target_line.find('>')
-            if tag_end == -1:
-                return ""
-            
-            tag_content = target_line[1:tag_end]
-            # Handle attributes - find first space or other delimiter
-            space_pos = tag_content.find(' ')
-            slash_pos = tag_content.find('/')
-            
-            # Find the earliest delimiter
-            delimiters = [pos for pos in [space_pos, slash_pos] if pos != -1]
-            if delimiters:
-                tag_name = tag_content[:min(delimiters)].strip()
-            else:
-                tag_name = tag_content.strip()
-            
-            self._debug_print(f"DEBUG: Looking for tag: {tag_name}")
-            
-            # Build element path map with parent relationships
-            element_paths = {}
-            self._build_element_paths(root, [], element_paths, None)
-            
-            # Find the element that corresponds to this line
-            target_element_path = self._find_element_path_at_line(root, tag_name, line_number, xml_content, element_paths)
-            
-            if target_element_path:
-                self._debug_print(f"DEBUG: Generated path: {target_element_path}")
-                return target_element_path
-            else:
-                self._debug_print(f"DEBUG: Could not find element at line {line_number}")
-                return ""
+        
+        import xml.sax
+        import io
+
+        class PathFinder(xml.sax.ContentHandler):
+            def __init__(self, target_line):
+                self.target_line = target_line
+                self.best_path = ""
+                self.stack = [] # (tag, path, start_line, child_counters)
+                self.locator = None
+                self.found = False
+
+            def setDocumentLocator(self, locator):
+                self.locator = locator
+
+            def startElement(self, name, attrs):
+                if self.found:
+                    return
+
+                start_line = self.locator.getLineNumber()
                 
+                # Calculate path
+                if not self.stack:
+                    # Root element
+                    path = f"/{name}[1]"
+                    child_counters = {}
+                    self.stack.append((name, path, start_line, child_counters))
+                else:
+                    parent_tag, parent_path, parent_start, parent_counters = self.stack[-1]
+                    
+                    # Update parent's child counters
+                    count = parent_counters.get(name, 0) + 1
+                    parent_counters[name] = count
+                    
+                    path = f"{parent_path}/{name}[{count}]"
+                    child_counters = {}
+                    self.stack.append((name, path, start_line, child_counters))
+
+            def endElement(self, name):
+                if self.found:
+                    return
+
+                if not self.stack:
+                    return
+
+                tag, path, start_line, _ = self.stack.pop()
+                end_line = self.locator.getLineNumber()
+
+                # Check if this element covers the target line
+                # Note: SAX line numbers are 1-based.
+                if start_line <= self.target_line <= end_line:
+                    # Found a candidate!
+                    # Since we process children before parents (in endElement),
+                    # the first match we hit is the deepest one.
+                    self.best_path = path
+                    self.found = True
+
+        handler = PathFinder(line_number)
+        parser = xml.sax.make_parser()
+        parser.setContentHandler(handler)
+        
+        try:
+            parser.parse(io.StringIO(xml_content))
         except Exception as e:
-            print(f"Error getting element path at line {line_number}: {e}")
-            import traceback
-            traceback.print_exc()
+            # If we found the path, we might have stopped parsing early (if we optimized)
+            # But here we parse full to be safe, or we could raise exception to stop
+            if handler.best_path:
+                self._debug_print(f"DEBUG: Resolved path (early exit): {handler.best_path}")
+                return handler.best_path
+            self._debug_print(f"DEBUG: SAX Parsing error: {e}")
             return ""
+            
+        if handler.best_path:
+            self._debug_print(f"DEBUG: Resolved path: {handler.best_path}")
+            return handler.best_path
+            
+        self._debug_print(f"DEBUG: No element found containing line {line_number}")
+        return ""
     
     def _build_element_paths(self, element, current_path, element_paths, parent=None):
         """Build a map of elements to their XPath with proper indexing"""
@@ -7747,8 +8018,10 @@ Total size: {stats.total_size} bytes"""
             return item
         # Try to sync from cursor
         try:
-            cursor = self.xml_editor.textCursor()
-            line = cursor.blockNumber() + 1
+            line = 0
+            line, _ = self.xml_editor.getCursorPosition()
+            line += 1
+                
             content = self.xml_editor.get_content()
             path = self._get_element_path_at_line(content, line)
             if path:
@@ -8345,61 +8618,25 @@ Total size: {stats.total_size} bytes"""
             # Calculate line count
             line_count = end_line - start_line + 1
             
-            # Create multiple selections to simulate a border effect
-            selections = []
-            
-            # Main block selection with orange background
-            cursor = self.xml_editor.textCursor()
-            cursor.movePosition(cursor.MoveOperation.Start)
-            cursor.movePosition(cursor.MoveOperation.Down, cursor.MoveMode.MoveAnchor, start_line - 1)
-            cursor.movePosition(cursor.MoveOperation.StartOfLine)
-            cursor.movePosition(cursor.MoveOperation.Down, cursor.MoveMode.KeepAnchor, line_count - 1)
-            cursor.movePosition(cursor.MoveOperation.EndOfLine, cursor.MoveMode.KeepAnchor)
-            
-            selection = QTextEdit.ExtraSelection()
-            selection.cursor = cursor
-            fmt = QTextCharFormat()
-            fmt.setBackground(QColor(255, 140, 0, 60))  # Orange background
-            selection.format = fmt
-            selections.append(selection)
-            
-            # Top border line (first line with darker orange)
-            cursor_top = self.xml_editor.textCursor()
-            cursor_top.movePosition(cursor_top.MoveOperation.Start)
-            cursor_top.movePosition(cursor_top.MoveOperation.Down, cursor_top.MoveMode.MoveAnchor, start_line - 1)
-            cursor_top.movePosition(cursor_top.MoveOperation.StartOfLine)
-            cursor_top.movePosition(cursor_top.MoveOperation.EndOfLine, cursor_top.MoveMode.KeepAnchor)
-            
-            selection_top = QTextEdit.ExtraSelection()
-            selection_top.cursor = cursor_top
-            fmt_top = QTextCharFormat()
-            fmt_top.setBackground(QColor(255, 100, 0, 120))  # Darker orange for border
-            selection_top.format = fmt_top
-            selections.append(selection_top)
-            
-            # Bottom border line (last line with darker orange)
-            if line_count > 1:
-                cursor_bottom = self.xml_editor.textCursor()
-                cursor_bottom.movePosition(cursor_bottom.MoveOperation.Start)
-                cursor_bottom.movePosition(cursor_bottom.MoveOperation.Down, cursor_bottom.MoveMode.MoveAnchor, end_line - 1)
-                cursor_bottom.movePosition(cursor_bottom.MoveOperation.StartOfLine)
-                cursor_bottom.movePosition(cursor_bottom.MoveOperation.EndOfLine, cursor_bottom.MoveMode.KeepAnchor)
+            # QScintilla highlighting using Indicators
+            if isinstance(self.xml_editor, QsciScintilla):
+                INDIC_BLOCK = 10 # Custom indicator for block highlight
+                self.xml_editor.clearIndicatorRange(0, 0, self.xml_editor.lines(), self.xml_editor.lineLength(self.xml_editor.lines()-1), INDIC_BLOCK)
+                self.xml_editor.indicatorDefine(QsciScintilla.StraightBoxIndicator, INDIC_BLOCK)
+                self.xml_editor.setIndicatorForegroundColor(QColor(255, 140, 0), INDIC_BLOCK)
+                self.xml_editor.setIndicatorAlpha(INDIC_BLOCK, 60)
+                self.xml_editor.setIndicatorOutlineAlpha(INDIC_BLOCK, 255)
+                self.xml_editor.setIndicatorDrawUnder(True, INDIC_BLOCK)
+                l_start = start_line - 1
+                l_end = end_line - 1
+                len_end = self.xml_editor.lineLength(l_end)
+                self.xml_editor.fillIndicatorRange(l_start, 0, l_end, len_end, INDIC_BLOCK)
                 
-                selection_bottom = QTextEdit.ExtraSelection()
-                selection_bottom.cursor = cursor_bottom
-                fmt_bottom = QTextCharFormat()
-                fmt_bottom.setBackground(QColor(255, 100, 0, 120))  # Darker orange for border
-                selection_bottom.format = fmt_bottom
-                selections.append(selection_bottom)
-            
-            # Apply all selections
-            self.xml_editor.setExtraSelections(selections)
-            
-            # Update status bar with line count
-            self.status_label.setText(f"Selected {xml_node.name} at line {start_line} ({line_count} line{'s' if line_count != 1 else ''})")
-            
-            print(f"HIGHLIGHT: Element {tag_name} from line {start_line} to {end_line} ({line_count} lines)")
-            
+                # Update status bar
+                self.status_label.setText(f"Selected {xml_node.name} at line {start_line} ({line_count} line{'s' if line_count != 1 else ''})")
+                print(f"HIGHLIGHT: Element {tag_name} from line {start_line} to {end_line} ({line_count} lines)")
+                return
+
         except Exception as e:
             print(f"Error highlighting element block: {e}")
     
@@ -8414,8 +8651,240 @@ Total size: {stats.total_size} bytes"""
             except Exception:
                 pass  # Silently fail for auto-save
     
+    def _get_file_state_key(self, file_path=None, zip_source=None):
+        """Generate unique key for file state storage"""
+        if zip_source:
+            # Use zip path and internal arc name as key
+            return f"{zip_source['zip_path']}|{zip_source['arc_name']}"
+        if file_path:
+            return file_path
+        return None
+
+    def _load_file_states(self):
+        """Load file states from persistent storage"""
+        self.file_states = {}
+        try:
+            # Load centralized file
+            state_path = os.path.join(os.path.expanduser("~"), ".visxml_file_states.json")
+            if os.path.exists(state_path):
+                with open(state_path, 'r', encoding='utf-8') as f:
+                    self.file_states = json.load(f)
+        except Exception as e:
+            print(f"Error loading file states: {e}")
+
+    def _save_file_states(self):
+        """Save file states to persistent storage"""
+        try:
+            from PyQt6.QtCore import QSettings
+            
+            # First, update state for all currently open tabs
+            if hasattr(self, 'tab_widget'):
+                for i in range(self.tab_widget.count()):
+                    widget = self.tab_widget.widget(i)
+                    if isinstance(widget, XmlEditorWidget):
+                        self._capture_editor_state(widget)
+
+            # Centralized save
+            state_path = os.path.join(os.path.expanduser("~"), ".visxml_file_states.json")
+            with open(state_path, 'w', encoding='utf-8') as f:
+                json.dump(self.file_states, f, indent=2)
+            
+            # Sidecar save (if enabled)
+            settings = QSettings("visxml.net", "LotusXmlEditor")
+            use_sidecar = settings.value("flags/store_settings_in_file_dir", False, type=bool)
+            
+            if use_sidecar:
+                 for key, state in self.file_states.items():
+                     if "|" not in key and os.path.exists(key): # Regular file
+                         try:
+                             sidecar_path = key + ".visxml_state"
+                             # Check if we have write permission
+                             if os.access(os.path.dirname(sidecar_path), os.W_OK):
+                                 with open(sidecar_path, 'w', encoding='utf-8') as f:
+                                     json.dump(state, f, indent=2)
+                         except Exception:
+                             pass
+        except Exception as e:
+            print(f"Error saving file states: {e}")
+
+    def _capture_editor_state(self, editor):
+        """Capture state from an editor widget"""
+        try:
+            from PyQt6.QtCore import QSettings
+            
+            # Check if feature is enabled
+            settings = QSettings("visxml.net", "LotusXmlEditor")
+            save_cursor = settings.value("flags/save_cursor_position", True, type=bool)
+            
+            if not save_cursor:
+                return
+
+            key = self._get_file_state_key(getattr(editor, 'file_path', None), getattr(editor, 'zip_source', None))
+            if not key:
+                return
+            
+            state = {
+                'timestamp': QDateTime.currentDateTime().toSecsSinceEpoch()
+            }
+            
+            # Capture state using QScintilla API
+            line, index = editor.getCursorPosition()
+            state['cursor_line'] = line
+            state['cursor_index'] = index
+            state['first_visible_line'] = editor.SendScintilla(QsciScintilla.SCI_GETFIRSTVISIBLELINE)
+            
+            if editor.hasSelectedText():
+                # getSelection returns (lineFrom, indexFrom, lineTo, indexTo)
+                state['selection_range'] = list(editor.getSelection())
+            
+            # Tree state
+            save_tree = settings.value("flags/save_tree_state", False, type=bool)
+
+            if save_tree:
+                is_current = False
+                if hasattr(self, 'xml_editor') and editor == self.xml_editor:
+                    is_current = True
+                
+                if is_current and hasattr(self, 'xml_tree'):
+                    current_item = self.xml_tree.currentItem()
+                    if current_item and hasattr(current_item, 'xml_node'):
+                         node = current_item.xml_node
+                         if hasattr(node, 'path'):
+                             state['tree_path'] = node.path
+            
+            # Merge with existing state to preserve other fields (like tree_path if not current)
+            if key in self.file_states:
+                existing = self.file_states[key]
+                if 'tree_path' in existing and 'tree_path' not in state:
+                    state['tree_path'] = existing['tree_path']
+
+            self.file_states[key] = state
+        except Exception as e:
+            print(f"Error capturing editor state: {e}")
+
+    def _restore_editor_state(self, editor):
+        """Restore state to an editor widget"""
+        try:
+            from PyQt6.QtCore import QSettings
+            
+            # Check if feature is enabled
+            settings = QSettings("visxml.net", "LotusXmlEditor")
+            save_cursor = settings.value("flags/save_cursor_position", True, type=bool)
+            
+            if not save_cursor:
+                return
+
+            key = self._get_file_state_key(getattr(editor, 'file_path', None), getattr(editor, 'zip_source', None))
+            if not key:
+                return
+            
+            state = None
+            if key in self.file_states:
+                state = self.file_states[key]
+            else:
+                # Try sidecar if enabled
+                use_sidecar = settings.value("flags/store_settings_in_file_dir", False, type=bool)
+                
+                if use_sidecar and "|" not in key and os.path.exists(key + ".visxml_state"):
+                    try:
+                        with open(key + ".visxml_state", 'r', encoding='utf-8') as f:
+                            state = json.load(f)
+                            self.file_states[key] = state # Cache it
+                    except Exception:
+                        pass
+            
+            if not state:
+                return
+            
+            # Restore cursor/selection using QScintilla API
+            # Helper to convert char offset to line/index
+            def pos_from_offset(offset):
+                text = editor.text()
+                # Clamp offset
+                if offset < 0: offset = 0
+                if offset > len(text): offset = len(text)
+                
+                line = text.count('\n', 0, offset)
+                last_nl = text.rfind('\n', 0, offset)
+                index = offset if last_nl == -1 else offset - last_nl - 1
+                return line, index
+
+            if 'cursor_line' in state and 'cursor_index' in state:
+                editor.setCursorPosition(state['cursor_line'], state['cursor_index'])
+                
+                if 'selection_range' in state:
+                    lf, if_, lt, it = state['selection_range']
+                    editor.setSelection(lf, if_, lt, it)
+            elif 'cursor_position' in state:
+                 # Legacy fallback: convert char position to line/index
+                 line, index = pos_from_offset(state['cursor_position'])
+                 editor.setCursorPosition(line, index)
+                 
+                 # Legacy selection fallback
+                 if 'selection_start' in state and 'selection_end' in state:
+                     start = state['selection_start']
+                     end = state['selection_end']
+                     if start != end:
+                         l1, i1 = pos_from_offset(start)
+                         l2, i2 = pos_from_offset(end)
+                         editor.setSelection(l1, i1, l2, i2)
+            
+            if 'first_visible_line' in state:
+                editor.SendScintilla(QsciScintilla.SCI_SETFIRSTVISIBLELINE, state['first_visible_line'])
+            
+            editor.ensureCursorVisible()
+
+            # Restore tree state
+            save_tree = settings.value("flags/save_tree_state", False, type=bool)
+            
+            if save_tree and 'tree_path' in state and hasattr(self, 'xml_editor') and editor == self.xml_editor:
+                 # Check if tree is populated
+                 tree_ready = False
+                 if hasattr(self, 'xml_tree') and self.xml_tree.topLevelItemCount() > 0:
+                     # Check if it's a placeholder only
+                     item = self.xml_tree.topLevelItem(0)
+                     if not getattr(item, 'lazy_loaded', False): # If lazy_loaded flag is False (meaning done) or not set
+                         tree_ready = True
+                 
+                 path = state['tree_path']
+                 
+                 if tree_ready:
+                     if hasattr(self, '_find_tree_item_by_path'):
+                         tree_item = self._find_tree_item_by_path(path)
+                         if tree_item:
+                             self.xml_tree.setCurrentItem(tree_item)
+                             parent = tree_item.parent()
+                             while parent:
+                                 parent.setExpanded(True)
+                                 parent = parent.parent()
+                             self.xml_tree.scrollToItem(tree_item)
+                             return
+
+                 # If we reached here, either tree not ready or item not found
+                 self._pending_tree_path = path
+        except Exception as e:
+            print(f"Error restoring editor state: {e}")
+
+    def _on_tree_built(self):
+        """Handle tree built signal to restore pending tree state"""
+        if self._pending_tree_path and hasattr(self, '_find_tree_item_by_path'):
+            path = self._pending_tree_path
+            self._pending_tree_path = None # Clear it
+            
+            tree_item = self._find_tree_item_by_path(path)
+            if tree_item:
+                self.xml_tree.setCurrentItem(tree_item)
+                parent = tree_item.parent()
+                while parent:
+                    parent.setExpanded(True)
+                    parent = parent.parent()
+                self.xml_tree.scrollToItem(tree_item)
+
     def _save_session(self):
         """Save current session state to file"""
+        # Also save persistent file states
+        self._save_file_states()
+        
         try:
             session = {
                 'tabs': [],
@@ -8432,11 +8901,17 @@ Total size: {stats.total_size} bytes"""
                 if isinstance(widget, XmlEditorWidget):
                     tab_data = {
                         'file_path': widget.file_path,
-                        'cursor_position': widget.textCursor().position(),
-                        'scroll_position': widget.verticalScrollBar().value(),
                         'bookmarks': widget.bookmarks,
                         'numbered_bookmarks': widget.numbered_bookmarks
                     }
+                    
+                    # Save state using QScintilla API
+                    line, index = widget.getCursorPosition()
+                    tab_data['cursor_line'] = line
+                    tab_data['cursor_index'] = index
+                    tab_data['first_visible_line'] = widget.SendScintilla(QsciScintilla.SCI_GETFIRSTVISIBLELINE)
+                    if widget.hasSelectedText():
+                        tab_data['selection_range'] = list(widget.getSelection())
                     
                     # Save zip source if present
                     if getattr(widget, 'zip_source', None):
@@ -8515,6 +8990,10 @@ Total size: {stats.total_size} bytes"""
                              show_line_numbers = self._read_flag('show_line_numbers', False)
                              new_editor.set_line_numbers_visible(show_line_numbers)
                              
+                             # Apply code folding setting
+                             code_folding = self._read_flag('code_folding', True)
+                             new_editor.set_code_folding_enabled(code_folding)
+                             
                              self.tab_widget.addTab(new_editor, "Document")
                              self.tab_widget.setCurrentWidget(new_editor)
                              # Force update of xml_editor reference since signals might be queued
@@ -8532,14 +9011,33 @@ Total size: {stats.total_size} bytes"""
                             
                         editor = self.xml_editor
                         
-                        # Restore state
-                        if 'cursor_position' in tab_data:
-                            cursor = editor.textCursor()
-                            cursor.setPosition(tab_data['cursor_position'])
-                            editor.setTextCursor(cursor)
+                        # Restore state using QScintilla API
+                        # Helper to convert char offset to line/index
+                        def pos_from_offset(offset):
+                            text = editor.text()
+                            # Clamp offset
+                            if offset < 0: offset = 0
+                            if offset > len(text): offset = len(text)
+                            
+                            line = text.count('\n', 0, offset)
+                            last_nl = text.rfind('\n', 0, offset)
+                            index = offset if last_nl == -1 else offset - last_nl - 1
+                            return line, index
+
+                        if 'cursor_line' in tab_data and 'cursor_index' in tab_data:
+                            editor.setCursorPosition(tab_data['cursor_line'], tab_data['cursor_index'])
+                            if 'selection_range' in tab_data:
+                                lf, if_, lt, it = tab_data['selection_range']
+                                editor.setSelection(lf, if_, lt, it)
+                        elif 'cursor_position' in tab_data:
+                            # Legacy fallback
+                            line, index = pos_from_offset(tab_data['cursor_position'])
+                            editor.setCursorPosition(line, index)
                         
-                        if 'scroll_position' in tab_data:
-                            editor.verticalScrollBar().setValue(tab_data['scroll_position'])
+                        if 'first_visible_line' in tab_data:
+                            editor.SendScintilla(QsciScintilla.SCI_SETFIRSTVISIBLELINE, tab_data['first_visible_line'])
+                        
+                        editor.ensureCursorVisible()
                             
                         if 'bookmarks' in tab_data:
                             bookmarks = {int(k): v for k, v in tab_data['bookmarks'].items()}
@@ -8592,6 +9090,23 @@ Total size: {stats.total_size} bytes"""
         except Exception as e:
             print(f"Error restoring session: {e}")
 
+    def select_node_and_scroll(self, node):
+        """Select node in tree and scroll to it in editor"""
+        if not node:
+            return
+            
+        # 1. Select in tree
+        if hasattr(self, 'tree_widget'):
+            self.tree_widget.select_node(node)
+            
+        # 2. Highlight in editor
+        if hasattr(self, 'xml_editor') and node.line_number > 0:
+            self.xml_editor.highlight_line(node.line_number)
+            
+        # 3. Focus
+        self.activateWindow()
+        self.raise_()
+
     def closeEvent(self, event):
         """Handle close event"""
         self._save_session()
@@ -8609,9 +9124,11 @@ Total size: {stats.total_size} bytes"""
     
     def toggle_theme(self):
         """Toggle between light and dark themes"""
+        # Check current state from persisted flag
+        is_dark = self._read_flag('dark_theme', True)
+        
         # Use QTimer to defer theme application and prevent UI hang
-        current_style = self.styleSheet()
-        if "dark" in current_style.lower():
+        if is_dark:
             QTimer.singleShot(0, self.set_light_theme)
         else:
             QTimer.singleShot(0, self.set_dark_theme)
@@ -8656,12 +9173,7 @@ Total size: {stats.total_size} bytes"""
         QToolButton:pressed {
             background-color: #094771;
         }
-        QTextEdit {
-            background-color: #1e1e1e;
-            color: #d4d4d4;
-            border: 1px solid #464647;
-            selection-background-color: #264f78;
-        }
+
         QTreeWidget {
             background-color: #252526;
             color: #d4d4d4;
@@ -8775,9 +9287,9 @@ Total size: {stats.total_size} bytes"""
         """
         self.setStyleSheet(dark_style)
         
-        # Update highlighter for dark theme
-        if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter'):
-            self.xml_editor.highlighter.set_dark_theme(True)
+        # Update editor for dark theme
+        if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'set_dark_theme'):
+            self.xml_editor.set_dark_theme(True)
         
         # Update breadcrumb label styling
         if hasattr(self, 'breadcrumb_label'):
@@ -8800,11 +9312,172 @@ Total size: {stats.total_size} bytes"""
     
     def set_light_theme(self):
         """Apply light theme"""
-        self.setStyleSheet("")
+        light_style = """
+        QMainWindow {
+            background-color: #f0f0f0;
+            color: #000000;
+        }
+        QMenuBar {
+            background-color: #f0f0f0;
+            color: #000000;
+            border-bottom: 1px solid #ccc;
+        }
+        QMenuBar::item:selected {
+            background-color: #e0e0e0;
+        }
+        QMenu {
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #ccc;
+        }
+        QMenu::item:selected {
+            background-color: #e0e0e0;
+        }
+        QToolBar {
+            background-color: #f0f0f0;
+            border: none;
+            padding: 2px;
+        }
+        QToolButton {
+            background-color: #f0f0f0;
+            color: #000000;
+            border: none;
+            padding: 4px;
+        }
+        QToolButton:hover {
+            background-color: #e0e0e0;
+        }
+        QToolButton:pressed {
+            background-color: #d0d0d0;
+        }
+        QTreeWidget {
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #ccc;
+            alternate-background-color: #f9f9f9;
+        }
+        QTreeWidget::item:selected {
+            background-color: #cce8ff;
+            color: #000000;
+        }
+        QTreeWidget::header {
+            background-color: #f0f0f0;
+            color: #000000;
+            border: 1px solid #ccc;
+        }
+        QTreeWidget::header::section {
+            background-color: #f0f0f0;
+            color: #000000;
+            border: 1px solid #ccc;
+            padding: 4px;
+        }
+        QTabWidget::pane {
+            border: 1px solid #ccc;
+            background-color: #ffffff;
+        }
+        QTabBar::tab {
+            background-color: #e0e0e0;
+            color: #000000;
+            border: 1px solid #ccc;
+            padding: 8px 16px;
+        }
+        QTabBar::tab:selected {
+            background-color: #ffffff;
+            border-bottom: 1px solid #ffffff;
+        }
+        QStatusBar {
+            background-color: #007acc;
+            color: white;
+        }
+        QPushButton {
+            background-color: #0e639c;
+            color: white;
+            border: none;
+            padding: 6px 16px;
+            border-radius: 3px;
+        }
+        QPushButton:hover {
+            background-color: #1177bb;
+        }
+        QPushButton:pressed {
+            background-color: #094771;
+        }
+        QLineEdit {
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #ccc;
+            padding: 4px;
+        }
+        QSpinBox {
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #ccc;
+        }
+        QListWidget {
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #ccc;
+        }
+        QLabel {
+            background-color: transparent;
+            color: #000000;
+        }
+        QScrollBar:vertical {
+            background-color: #f0f0f0;
+            border: none;
+            width: 14px;
+            margin: 0px;
+        }
+        QScrollBar::handle:vertical {
+            background-color: #cdcdcd;
+            border-radius: 7px;
+            min-height: 20px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background-color: #a6a6a6;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            border: none;
+            background: none;
+            height: 0px;
+        }
+        QScrollBar:horizontal {
+            background-color: #f0f0f0;
+            border: none;
+            height: 14px;
+            margin: 0px;
+        }
+        QScrollBar::handle:horizontal {
+            background-color: #cdcdcd;
+            border-radius: 7px;
+            min-width: 20px;
+        }
+        QScrollBar::handle:horizontal:hover {
+            background-color: #a6a6a6;
+        }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+            border: none;
+            background: none;
+            width: 0px;
+        }
+        """
+        self.setStyleSheet(light_style)
         
-        # Update highlighter for light theme
-        if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'highlighter'):
-            self.xml_editor.highlighter.set_dark_theme(False)
+        # Update editor for light theme
+        if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'set_dark_theme'):
+            self.xml_editor.set_dark_theme(False)
+        
+        # Update breadcrumb label styling for light theme
+        if hasattr(self, 'breadcrumb_label'):
+            self.breadcrumb_label.setStyleSheet("""
+                QLabel {
+                    background-color: #f0f0f0;
+                    color: #000000;
+                    padding: 4px 8px;
+                    border: 1px solid #ccc;
+                    border-radius: 3px;
+                }
+            """)
         
         self.status_label.setText("Light theme enabled")
         # Persist theme selection
@@ -9013,14 +9686,7 @@ Total size: {stats.total_size} bytes"""
         try:
             if xml_node and xml_node.line_number > 0:
                 # Move cursor to line in editor
-                cursor = self.xml_editor.textCursor()
-                cursor.movePosition(cursor.MoveOperation.Start)
-                cursor.movePosition(
-                    cursor.MoveOperation.Down,
-                    cursor.MoveMode.MoveAnchor,
-                    xml_node.line_number - 1
-                )
-                self.xml_editor.setTextCursor(cursor)
+                self.xml_editor.setCursorPosition(xml_node.line_number - 1, 0)
                 self.xml_editor.ensureCursorVisible()
                 self.status_label.setText(f"Jumped to line {xml_node.line_number}: {xml_node.name}")
         except Exception as e:
@@ -9032,7 +9698,7 @@ Total size: {stats.total_size} bytes"""
         """Extract XML content for a node and all its subnodes"""
         try:
             # Get the full XML content
-            full_content = self.xml_editor.get_content()
+            full_content = self.xml_editor.text()
             if not full_content.strip():
                 return None
             
@@ -9154,8 +9820,7 @@ Total size: {stats.total_size} bytes"""
     
     def toggle_bookmark(self):
         """Toggle bookmark at current line"""
-        cursor = self.xml_editor.textCursor()
-        line_number = cursor.blockNumber() + 1
+        line_number = self.xml_editor.getCursorPosition()[0] + 1
         
         if line_number in self.bookmarks:
             # Remove bookmark
@@ -9201,8 +9866,7 @@ Total size: {stats.total_size} bytes"""
             self.status_label.setText("No bookmarks set")
             return
         
-        cursor = self.xml_editor.textCursor()
-        current_line = cursor.blockNumber() + 1
+        current_line = self.xml_editor.getCursorPosition()[0] + 1
         
         # Get sorted list of bookmark lines
         bookmark_lines = sorted(self.bookmarks.keys())
@@ -9227,8 +9891,7 @@ Total size: {stats.total_size} bytes"""
             self.status_label.setText("No bookmarks set")
             return
         
-        cursor = self.xml_editor.textCursor()
-        current_line = cursor.blockNumber() + 1
+        current_line = self.xml_editor.getCursorPosition()[0] + 1
         
         # Get sorted list of bookmark lines
         bookmark_lines = sorted(self.bookmarks.keys())
@@ -9274,20 +9937,14 @@ Total size: {stats.total_size} bytes"""
     def _update_bookmark_highlights(self):
         """Highlight bookmarked lines in the editor using extra selections"""
         try:
-            selections = []
-            doc = self.xml_editor.document()
-            for line in self.bookmarks.keys():
-                block = doc.findBlockByNumber(line - 1)
-                if not block.isValid():
-                    continue
-                cursor = QTextCursor(block)
-                fmt = QTextCharFormat()
-                fmt.setBackground(QColor(255, 240, 200))  # soft highlight color
-                sel = QTextEdit.ExtraSelection()
-                sel.cursor = cursor
-                sel.format = fmt
-                selections.append(sel)
-            self.xml_editor.setExtraSelections(selections)
+            # QScintilla compatibility
+            if isinstance(self.xml_editor, QsciScintilla):
+                # Use markers for QScintilla
+                # Marker 1 is used for bookmarks
+                self.xml_editor.markerDeleteAll(1) 
+                for line in self.bookmarks.keys():
+                    self.xml_editor.markerAdd(line - 1, 1)
+                return
         except Exception:
             pass
 
@@ -9295,8 +9952,7 @@ Total size: {stats.total_size} bytes"""
         """Copy XPath of current cursor position to Links tab (Ctrl+F11)"""
         try:
             # Get current cursor position
-            cursor = self.xml_editor.textCursor()
-            line_number = cursor.blockNumber() + 1
+            line_number = self.xml_editor.getCursorPosition()[0] + 1
             
             # Get XML content
             content = self.xml_editor.get_content()
@@ -9309,15 +9965,14 @@ Total size: {stats.total_size} bytes"""
             
             if xpath:
                 # Add XPath to Links tab (append new line)
-                current_text = self.bottom_panel.links_text.toPlainText()
+                current_text = self.bottom_panel.links_text.text()
                 if current_text and not current_text.endswith('\n'):
-                    current_text += '\n'
-                self.bottom_panel.links_text.setPlainText(current_text + xpath)
+                    self.bottom_panel.links_text.append('\n')
                 
-                # Move cursor to end
-                cursor = self.bottom_panel.links_text.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                self.bottom_panel.links_text.setTextCursor(cursor)
+                self.bottom_panel.links_text.append(xpath)
+                
+                # Scroll to end
+                self.bottom_panel.links_text.SendScintilla(QsciScintilla.SCI_DOCUMENTEND)
                 
                 # Show Links tab
                 self._show_bottom_panel_auto("links")
@@ -9334,16 +9989,16 @@ Total size: {stats.total_size} bytes"""
         """Navigate to XPath from current line in Links tab (F12)"""
         try:
             # Get current line from Links tab
-            cursor = self.bottom_panel.links_text.textCursor()
-            cursor.select(QTextCursor.SelectionType.LineUnderCursor)
-            xpath = cursor.selectedText().strip()
+            line, _ = self.bottom_panel.links_text.getCursorPosition()
+            xpath = self.bottom_panel.links_text.text(line).strip()
             
-            if not xpath:
+            if not xpath or xpath.startswith("<!--"):
                 self.status_label.setText("No XPath link on current line")
                 return
             
             # Get XML content
-            content = self.xml_editor.get_content()
+            content = self.xml_editor.text()
+
             if not content.strip():
                 self.status_label.setText("No XML content to navigate")
                 return
@@ -9375,8 +10030,9 @@ Total size: {stats.total_size} bytes"""
     def set_numbered_bookmark(self, digit: int):
         """Set a numbered bookmark (1..9) to current line"""
         try:
-            cursor = self.xml_editor.textCursor()
-            line_number = cursor.blockNumber() + 1
+            line, _ = self.xml_editor.getCursorPosition()
+            line_number = line + 1
+            
             self.numbered_bookmarks[digit] = line_number
             self.status_label.setText(f"Set bookmark {digit} at line {line_number}")
             # Ensure it's also present in normal bookmarks for list/highlight
@@ -9526,7 +10182,7 @@ Total size: {stats.total_size} bytes"""
                     QApplication.processEvents()  # Update UI
                     
                     # Read large files in chunks to avoid memory issues
-                    content = self._read_large_file(file_path)
+                    content = self._read_file_robust(file_path)
                 else:
                     # Read small files normally with encoding fallback
                     try:
@@ -9618,6 +10274,10 @@ Total size: {stats.total_size} bytes"""
         # Update encoding label
         self.encoding_label.setText("UTF-8")
         
+        # Restore editor state (cursor, selection, etc.)
+        if hasattr(self, '_restore_editor_state') and hasattr(self, 'xml_editor'):
+             self._restore_editor_state(self.xml_editor)
+        
         # Add to recent files
         self._add_to_recent_files(file_path)
     
@@ -9643,6 +10303,10 @@ Total size: {stats.total_size} bytes"""
         
         # Update encoding label
         self.encoding_label.setText("UTF-8")
+
+        # Restore editor state (cursor, selection, etc.)
+        if hasattr(self, '_restore_editor_state') and hasattr(self, 'xml_editor'):
+             self._restore_editor_state(self.xml_editor)
     
     def _try_load_from_cache(self, file_path: str, file_size: int) -> bool:
         """Try to load file from cache for faster startup
@@ -10313,19 +10977,14 @@ Total size: {stats.total_size} bytes"""
 
     def _apply_text_transform(self, transform_func):
         """Apply a text transformation function to the selected text."""
-        cursor = self.xml_editor.textCursor()
-        if not cursor.hasSelection():
+        if not self.xml_editor.hasSelectedText():
              QMessageBox.information(self, "No Selection", "Please select text to transform.")
              return
-             
-        selected_text = cursor.selectedText()
-        # Handle paragraph separator from PyQt6
-        raw_text = selected_text.replace('\u2029', '\n')
-        new_text = transform_func(raw_text)
         
-        cursor.beginEditBlock()
-        cursor.insertText(new_text)
-        cursor.endEditBlock()
+        selected_text = self.xml_editor.selectedText()
+        new_text = transform_func(selected_text)
+        
+        self.xml_editor.replaceSelectedText(new_text)
         
     def escape_selection_entities(self):
         """Convert special characters in selection to XML entities."""
@@ -10406,33 +11065,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    def paintEvent(self, event):
-        # Default paint
-        super().paintEvent(event)
-        # Overlay painting for bookmark markers at the right border
-        try:
-            mw = self.window()
-            if not hasattr(mw, 'bookmarks') or not mw.bookmarks:
-                return
-            vp = self.viewport()
-            w = vp.width()
-            x = w - 8  # marker x position from right edge
-            painter = QPainter(vp)
-            color = QColor(255, 200, 120, 180)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(color)
-            for line in mw.bookmarks.keys():
-                try:
-                    block = self.document().findBlockByNumber(line - 1)
-                    if not block.isValid():
-                        continue
-                    cursor = QTextCursor(block)
-                    rect = self.cursorRect(cursor)
-                    y = rect.y()
-                    # Draw a small rounded marker
-                    painter.drawRoundedRect(x, y + 1, 6, 3, 1.5, 1.5)
-                except Exception:
-                    continue
-            painter.end()
-        except Exception:
-            pass

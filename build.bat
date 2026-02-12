@@ -18,7 +18,7 @@ if %errorlevel% equ 0 (
     echo ✅ Build completed successfully!
     echo.
     echo The executable can be found in the 'dist' folder.
-    echo You can now run Lotus Xml Editor.exe directly!
+    echo You can now run lxe.exe directly!
 ) else (
     echo.
     echo ❌ Build failed. Please check the error messages above.

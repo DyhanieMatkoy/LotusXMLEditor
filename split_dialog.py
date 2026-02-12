@@ -1,11 +1,12 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QSpinBox, 
-    QDoubleSpinBox, QCheckBox, QLineEdit, QTextEdit, QPushButton, 
+    QDoubleSpinBox, QCheckBox, QLineEdit, QPushButton, 
     QGroupBox, QComboBox, QListWidget, QListWidgetItem, QMessageBox,
     QFileDialog, QProgressBar, QTabWidget, QWidget
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QIcon
+from PyQt6.QtGui import QFont, QIcon, QColor
+from PyQt6.Qsci import QsciScintilla, QsciLexerXML
 import os
 from xml_splitter import XmlSplitConfig, XmlSplitRule
 from xml_service import XmlService
@@ -80,11 +81,6 @@ class XmlSplitConfigDialog(QDialog):
                 background-color: #3c3c3c;
                 border: 1px solid #5a5a5a;
                 padding: 4px;
-                border-radius: 3px;
-            }
-            QTextEdit {
-                background-color: #2d2d30;
-                border: 1px solid #5a5a5a;
                 border-radius: 3px;
             }
             QListWidget {
@@ -259,9 +255,16 @@ class XmlSplitConfigDialog(QDialog):
         self.xpath_cb = QCheckBox("Split by XPath expression:")
         xpath_layout.addWidget(self.xpath_cb)
         
-        self.xpath_edit = QTextEdit()
+        self.xpath_edit = QsciScintilla()
+        self.xpath_edit.setUtf8(True)
+        self.xpath_edit.setFont(QFont("Consolas", 10))
+        self.xpath_edit.setMarginsBackgroundColor(QColor("#2b2b2b"))
+        self.xpath_edit.setPaper(QColor("#2d2d30"))
+        self.xpath_edit.setColor(QColor("#cccccc"))
+        self.xpath_edit.setCaretForegroundColor(QColor("white"))
         self.xpath_edit.setMaximumHeight(80)
-        self.xpath_edit.setPlaceholderText("Enter XPath expression...")
+        # self.xpath_edit.setPlaceholderText("Enter XPath expression...") # QScintilla does not support placeholder text
+        self.xpath_edit.setToolTip("Enter XPath expression...")
         self.xpath_edit.setEnabled(False)
         xpath_layout.addWidget(self.xpath_edit)
         
@@ -280,9 +283,16 @@ class XmlSplitConfigDialog(QDialog):
         results_group = QGroupBox("XML Structure Analysis")
         results_layout = QVBoxLayout(results_group)
         
-        self.analysis_text = QTextEdit()
+        self.analysis_text = QsciScintilla()
+        self.analysis_text.setUtf8(True)
+        self.analysis_text.setFont(QFont("Consolas", 10))
         self.analysis_text.setReadOnly(True)
-        self.analysis_text.setPlaceholderText("Click 'Analyze XML' to see structure analysis...")
+        self.analysis_text.setText("Click 'Analyze XML' to see structure analysis...")
+        self.analysis_text.setMargins(0)
+        self.analysis_text.setMarginWidth(0, 0)
+        self.analysis_text.setMarginWidth(1, 0)
+        self.analysis_text.setPaper(QColor("#2d2d30"))
+        self.analysis_text.setColor(QColor("#cccccc"))
         results_layout.addWidget(self.analysis_text)
         
         layout.addWidget(results_group)
@@ -338,7 +348,7 @@ class XmlSplitConfigDialog(QDialog):
         
         # Update analysis text
         analysis_text = self.format_analysis_result(analysis)
-        self.analysis_text.setPlainText(analysis_text)
+        self.analysis_text.setText(analysis_text)
         
         # Update recommendations
         self.update_recommendations(analysis)
@@ -472,8 +482,8 @@ class XmlSplitConfigDialog(QDialog):
         if self.size_cb.isChecked():
             config.add_rule(XmlSplitRule.create_size_rule(self.size_spin.value() * 1024))  # Convert KB to bytes
         
-        if self.xpath_cb.isChecked() and self.xpath_edit.toPlainText().strip():
-            config.add_rule(XmlSplitRule.create_xpath_rule(self.xpath_edit.toPlainText().strip()))
+        if self.xpath_cb.isChecked() and self.xpath_edit.text().strip():
+            config.add_rule(XmlSplitRule.create_xpath_rule(self.xpath_edit.text().strip()))
         
         return config
     

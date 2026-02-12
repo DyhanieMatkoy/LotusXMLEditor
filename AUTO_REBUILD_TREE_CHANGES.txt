@@ -1,0 +1,131 @@
+═══════════════════════════════════════════════════════════════════════════════
+                    AutoRebuildTree Feature - Changes List
+═══════════════════════════════════════════════════════════════════════════════
+
+MODIFIED FILES:
+───────────────────────────────────────────────────────────────────────────────
+
+1. main.py
+   ├─ Added variables (around line 2410):
+   │  ├─ self.auto_rebuild_tree = True
+   │  └─ self._tree_needs_rebuild = False
+   │
+   ├─ Added indicator widget (around line 3175):
+   │  ├─ self.tree_rebuild_indicator = QLabel("⚠")
+   │  ├─ Styled: orange color, 16px, bold
+   │  └─ Added to toolbar before "Rebuild Tree" button
+   │
+   ├─ Modified on_content_changed() (around line 6190):
+   │  ├─ Check if auto_rebuild_tree is enabled
+   │  ├─ If disabled: show indicator, skip tree update
+   │  └─ If enabled: proceed with debounced update
+   │
+   ├─ Modified rebuild_tree_with_autoclose() (around line 5962):
+   │  ├─ Reset _tree_needs_rebuild flag
+   │  └─ Hide tree_rebuild_indicator
+   │
+   └─ Modified _load_persisted_flags() (around line 4180):
+      └─ Load auto_rebuild_tree from QSettings
+
+2. settings_dialog.py
+   ├─ Added setting to settings_structure (around line 20):
+   │  └─ "auto_rebuild_tree": ("Auto Rebuild Tree", "bool", True, "...")
+   │
+   ├─ Modified _load_current_values() (around line 80):
+   │  └─ Added "auto_rebuild_tree" to flags/ mapping
+   │
+   ├─ Modified _save_and_close() (around line 230):
+   │  └─ Added "auto_rebuild_tree" to flags/ mapping
+   │
+   └─ Modified _apply_settings_to_parent() (around line 270):
+      └─ Apply auto_rebuild_tree to parent window
+
+CREATED FILES:
+───────────────────────────────────────────────────────────────────────────────
+
+Documentation:
+├─ doc/AUTO_REBUILD_TREE_FEATURE.md     - Full documentation (English)
+├─ doc/AUTO_REBUILD_TREE_RU.md          - Quick guide (Russian)
+├─ doc/AUTO_REBUILD_TREE_VISUAL.txt     - Visual guide with ASCII art
+├─ CHANGELOG_AUTO_REBUILD_TREE.md       - Detailed changelog
+├─ AUTO_REBUILD_TREE_README.md          - User quick start guide
+├─ AUTO_REBUILD_TREE_SUMMARY.md         - Technical summary
+└─ AUTO_REBUILD_TREE_CHANGES.txt        - This file
+
+Testing:
+└─ test_auto_rebuild_tree.py            - Unit test for the feature
+
+TECHNICAL DETAILS:
+───────────────────────────────────────────────────────────────────────────────
+
+Setting Storage:
+├─ Key: flags/auto_rebuild_tree
+├─ Type: Boolean
+├─ Default: True
+├─ Storage: QSettings("visxml.net", "LotusXmlEditor")
+└─ Scope: User-specific, persistent across sessions
+
+Indicator Details:
+├─ Symbol: ⚠ (Unicode U+26A0)
+├─ Color: Orange (#FFA500)
+├─ Size: 16px
+├─ Weight: Bold
+├─ Position: Left of "Rebuild Tree" button
+├─ Visibility: Only when auto_rebuild_tree=False AND text changed
+└─ Tooltip: "Tree needs rebuild - click 'Rebuild Tree' to update"
+
+Behavior:
+├─ When enabled (default):
+│  └─ Tree updates automatically after 5 seconds (debounce)
+│
+└─ When disabled:
+   ├─ Tree does NOT update automatically
+   ├─ Indicator ⚠ appears on text change
+   ├─ User clicks "Rebuild Tree" (F11)
+   ├─ Indicator disappears
+   └─ Tree updates manually
+
+KEYBOARD SHORTCUTS:
+───────────────────────────────────────────────────────────────────────────────
+
+F11 - Rebuild Tree (manual rebuild, hides indicator)
+
+TESTING:
+───────────────────────────────────────────────────────────────────────────────
+
+Run test:
+$ python test_auto_rebuild_tree.py
+
+Expected output:
+✓ Test 1 passed: auto_rebuild_tree saved as True
+✓ Test 2 passed: auto_rebuild_tree saved as False
+✓ Test 3 passed: auto_rebuild_tree defaults to True
+✓ All tests passed!
+
+USAGE SCENARIOS:
+───────────────────────────────────────────────────────────────────────────────
+
+Disable auto-rebuild when:
+├─ Working with large XML files (>1MB)
+├─ Making multiple consecutive edits
+├─ CPU performance is a concern
+└─ Want manual control over tree updates
+
+Keep auto-rebuild enabled when:
+├─ Working with small files (<100KB)
+├─ Want immediate visual feedback
+├─ Performance is not an issue
+└─ Prefer convenience over control
+
+COMPATIBILITY:
+───────────────────────────────────────────────────────────────────────────────
+
+✓ Windows (tested)
+✓ PyQt6
+✓ QSettings persistence
+✓ Backward compatible (default: enabled)
+✓ No breaking changes
+
+═══════════════════════════════════════════════════════════════════════════════
+                              End of Changes List
+═══════════════════════════════════════════════════════════════════════════════

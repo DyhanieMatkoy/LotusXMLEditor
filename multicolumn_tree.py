@@ -203,8 +203,10 @@ class MultiColumnTreeWidget(QScrollArea):
         try:
             # Parse XML using the service
             service = XmlService()
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(xml_content)
+            root = service.parse_xml(xml_content)
+            if root is None:
+                print("Failed to parse XML in multicolumn tree")
+                return
             root_node = service._element_to_tree_node(root)
             
             if root_node:

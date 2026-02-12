@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration>
+    <Database>
+        <Connection>
+            <Server>localhost</Server>
+            <Port>5432</Port>
+            <Username>admin</Username>
+            <Password>secret</Password>
+        </Connection>
+        <Pool>
+            <MinSize>5</MinSize>
+            <MaxSize>20</MaxSize>
+            <Timeout>30</Timeout>
+        </Pool>
+    </Database>
+    <Application>
+        <Settings>
+            <Timeout>60</Timeout>
+            <MaxRetries>3</MaxRetries>
+            <LogLevel>INFO</LogLevel>
+        </Settings>
+        <Features>
+            <Feature name="caching" enabled="true">
+                <CacheSize>1000</CacheSize>
+                <TTL>3600</TTL>
+            </Feature>
+            <Feature name="compression" enabled="false">
+                <Level>9</Level>
+            </Feature>
+        </Features>
+    </Application>
+    <Security>
+        <Authentication>
+            <Method>OAuth2</Method>
+            <TokenExpiry>7200</TokenExpiry>
+        </Authentication>
+        <Encryption>
+            <Algorithm>AES-256</Algorithm>
+            <KeyRotation>30</KeyRotation>
+        </Encryption>
+    </Security>
+</Configuration>
