@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QTreeWidget,
                              QFileDialog, QMessageBox, QLineEdit, QCheckBox, QComboBox, QToolButton,
                              QDialog, QDialogButtonBox, QSpinBox, QFrame,
                              QHeaderView, QTreeWidgetItemIterator, QMenu, QDockWidget, QProgressBar, QInputDialog, QStyle)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QDateTime, QSettings, QThread, QByteArray, QMimeData, QUrl
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QDateTime, QSettings, QThread, QByteArray, QMimeData, QUrl, QEvent
 from PyQt6.QtGui import QAction, QIcon, QFont, QColor, QPainter, QShortcut, QKeySequence
 from PyQt6.Qsci import QsciScintilla, QsciLexerXML
 import re
@@ -51,6 +51,8 @@ from metro_navigator import MetroNavigatorWindow
 from about_dialog import AboutDialog
 from favorites_widget import FavoritesWidget
 from object_form import ObjectNodeForm
+from ftp_manager import FtpManager
+from ftp_dialogs import FtpBrowserDialog, FtpProfilesDialog
 
 
 class XmlTreeWidget(QTreeWidget):
@@ -1440,8 +1442,19 @@ class XmlEditorWidget(QsciScintilla):
             settings = QSettings("visxml.net", "LotusXmlEditor")
             font_family = settings.value("editor_font_family", "Consolas")
             font_size = int(settings.value("editor_font_size", 11))
+            
+            # Robust boolean reading for theme
+            val = settings.value("flags/dark_theme")
+            if val is None:
+                self.is_dark_theme = True # Default to Dark matching MainWindow
+            elif isinstance(val, bool):
+                self.is_dark_theme = val
+            elif isinstance(val, str):
+                self.is_dark_theme = val.lower() in ("1", "true", "yes", "on")
+            else:
+                self.is_dark_theme = bool(val)
         except Exception:
-            pass
+            self.is_dark_theme = True
             
         font = QFont(font_family, font_size)
         self.setFont(font)
@@ -1499,22 +1512,50 @@ class XmlEditorWidget(QsciScintilla):
             'hide_tags': False,
             'hide_values': False
         }
-        self.is_dark_theme = False
+        # self.is_dark_theme = False (removed redundancy)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Force update colors when shown to ensure theme is applied correctly
+        # This fixes the issue where Scintilla starts with light theme despite dark mode
+        QTimer.singleShot(0, self.update_colors)
 
     def mousePressEvent(self, event):
+        print(f"DEBUG: mousePressEvent called. Button={event.button()}, Modifiers={event.modifiers()}")
         if event.button() == Qt.MouseButton.LeftButton and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             # Handle Ctrl+Click for definition lookup
             pos = event.pos()
             # Convert visual position to scintilla position
             scint_pos = self.SendScintilla(QsciScintilla.SCI_POSITIONFROMPOINT, pos.x(), pos.y())
+            print(f"DEBUG: mousePressEvent pos={pos}, scint_pos={scint_pos}")
             
             if scint_pos != -1:
                 line, index = self.lineIndexFromPosition(scint_pos)
                 # Get line text
                 text = self.text(line)
+                print(f"DEBUG: line={line}, index={index}, len(text)={len(text)}")
+                print(f"DEBUG: line text='{text}'")
+                
+                # QScintilla might return byte index. If so, we need to adjust.
+                # Heuristic: if index > len(text) and text has unicode, it's likely byte index.
+                if index >= len(text) and len(text.encode('utf-8')) >= index:
+                     print("DEBUG: index seems to be byte offset, attempting adjustment")
+                     try:
+                         byte_text = text.encode('utf-8')
+                         # Truncate to byte index
+                         sub_bytes = byte_text[:index]
+                         # Decode to find char length
+                         char_index = len(sub_bytes.decode('utf-8'))
+                         print(f"DEBUG: adjusted index from {index} to {char_index}")
+                         index = char_index
+                     except Exception as e:
+                         print(f"DEBUG: index adjustment failed: {e}")
+
                 if index < len(text):
                     # Check if inside quotes
                     self._check_definition_lookup(text, index)
+                else:
+                    print(f"DEBUG: index {index} out of bounds for text length {len(text)}")
         
         super().mousePressEvent(event)
 
@@ -1528,29 +1569,35 @@ class XmlEditorWidget(QsciScintilla):
             # Find opening quote before index
             start_quote = -1
             for i in range(index, -1, -1):
-                if text[i] == '"':
+                if text[i] == '(':
                     start_quote = i
                     break
             
+            print(f"DEBUG: start_quote={start_quote}")
             if start_quote == -1:
                 return
 
             # Find closing quote after index
             end_quote = -1
             for i in range(index, len(text)):
-                if text[i] == '"':
+                if text[i] == ')':
                     end_quote = i
                     break
             
+            print(f"DEBUG: end_quote={end_quote}")
             if end_quote == -1:
                 return
             
             # Ensure we are inside the quotes (not on them)
             if start_quote < index < end_quote:
                 content = text[start_quote+1 : end_quote]
+                print(f"DEBUG: found content inside quotes: '{content}'")
                 # Check pattern
                 if content.startswith("Запросы.") or content.startswith("Алгоритмы."):
+                    print(f"DEBUG: emitting definition_lookup_requested for '{content}'")
                     self.definition_lookup_requested.emit(content)
+                else:
+                    print(f"DEBUG: content does not start with expected prefix")
 
         except Exception as e:
             print(f"Definition lookup check error: {e}")
@@ -1607,6 +1654,14 @@ class XmlEditorWidget(QsciScintilla):
         if enabled:
             self.setMarginType(1, QsciScintilla.MarginType.SymbolMargin)
             self.setMarginWidth(1, 20)
+            
+            # Explicitly set the margin mask to show fold markers (SC_MASK_FOLDERS)
+            # SC_MASK_FOLDERS = 0xFE000000, SCI_SETMARGINMASK = 2244, SCI_SETMARGINSENSITIVE = 2246
+            # Pass as signed 32-bit int to avoid OverflowError on Windows
+            # 0xFE000000 as signed int is -33554432
+            self.SendScintilla(2244, 1, -33554432)
+            self.SendScintilla(2246, 1, 1)
+            
             self.setFolding(QsciScintilla.FoldStyle.BoxedTreeFoldStyle)
         else:
             self.setMarginWidth(1, 0)
@@ -1635,8 +1690,10 @@ class XmlEditorWidget(QsciScintilla):
         lexer = QsciLexerXML(self)
         lexer.setDefaultFont(self.font())
         self.setLexer(lexer)
-        # Apply default light theme initially
-        self.set_dark_theme(False)
+        # Apply saved theme initially (if dark)
+        # If is_dark_theme is False, the default QScintilla colors might still be used,
+        # so we should explicitly call update_colors() regardless.
+        self.update_colors()
 
     def set_dark_theme(self, dark_theme=True):
         """Apply dark or light theme colors to the lexer."""
@@ -1666,8 +1723,8 @@ class XmlEditorWidget(QsciScintilla):
             background_color = QColor("#1e1e1e")
             
             tag_color = QColor("#569CD6") # Blue
-            attr_color = QColor("#D4D4D4") # Light Grey
-            value_color = QColor("#B5CEA8") # Light Green
+            attr_color = QColor("#9CDCFE") # Light Blue (VS Code)
+            value_color = QColor("#CE9178") # Orange/Red
             comment_color = QColor("#6A9955") # Green
             cdata_color = QColor("#D7BA7D") # Light yellow
             entity_color = QColor("#C586C0") # Pink
@@ -1678,6 +1735,13 @@ class XmlEditorWidget(QsciScintilla):
             self.setMarginsBackgroundColor(QColor("#252526"))
             self.setMarginsForegroundColor(QColor("#858585"))
             self.setCaretForegroundColor(QColor("#ffffff"))
+            self.setCaretLineBackgroundColor(QColor("#2d2d30"))
+            self.setCaretLineVisible(True)
+            self.setFoldMarginColors(QColor("#858585"), QColor("#252526"))
+            
+            # Set default lexer colors
+            lexer.setDefaultPaper(background_color)
+            lexer.setDefaultColor(default_color)
             
         else:
             # Light Theme Colors (Modern/VS Code style)
@@ -1686,7 +1750,7 @@ class XmlEditorWidget(QsciScintilla):
             
             tag_color = QColor("#0000FF") # Blue (Keywords)
             attr_color = QColor("#A31515") # Dark Red (Attributes)
-            value_color = QColor("#008000") # Green (Strings)
+            value_color = QColor("#0451A5") # Dark Blue
             comment_color = QColor("#008000") # Green
             cdata_color = QColor("#8B4513") # Brown
             entity_color = QColor("#FF00FF") # Magenta
@@ -1697,6 +1761,13 @@ class XmlEditorWidget(QsciScintilla):
             self.setMarginsBackgroundColor(QColor("#f0f0f0"))
             self.setMarginsForegroundColor(QColor("#333333"))
             self.setCaretForegroundColor(QColor("#000000"))
+            self.setCaretLineBackgroundColor(QColor("#e8e8e8"))
+            self.setCaretLineVisible(True)
+            self.setFoldMarginColors(QColor("#999999"), QColor("#f0f0f0"))
+            
+            # Set default lexer colors
+            lexer.setDefaultPaper(background_color)
+            lexer.setDefaultColor(default_color)
 
         # Apply visibility overrides (hide by setting to background color)
         if self.visibility_options['hide_tags'] or self.visibility_options['hide_symbols']:
@@ -1706,6 +1777,12 @@ class XmlEditorWidget(QsciScintilla):
             value_color = background_color
 
         # Lexer colors
+        styles = [QsciLexerXML.Default, QsciLexerXML.Tag, QsciLexerXML.Attribute, 
+                  QsciLexerXML.HTMLDoubleQuotedString, QsciLexerXML.HTMLSingleQuotedString, 
+                  QsciLexerXML.HTMLComment, QsciLexerXML.CDATA, QsciLexerXML.Entity, QsciLexerXML.XMLStart]
+        for style in styles:
+            lexer.setPaper(background_color, style)
+
         lexer.setColor(default_color, QsciLexerXML.Default)
         lexer.setColor(tag_color, QsciLexerXML.Tag)
         lexer.setColor(attr_color, QsciLexerXML.Attribute)
@@ -1736,24 +1813,21 @@ class XmlEditorWidget(QsciScintilla):
             return
             
         # Search and highlight
-        search_bytes = text.encode('utf-8')
         
         for line_idx in range(self.lines()):
             line_text = self.text(line_idx)
-            # Ensure we have bytes for searching to match QScintilla's internal byte offsets
-            line_bytes = line_text.encode('utf-8')
             
             start_idx = 0
             while True:
-                idx = line_bytes.find(search_bytes, start_idx)
+                idx = line_text.find(text, start_idx)
                 if idx == -1:
                     break
                 
-                # fillIndicatorRange uses byte offsets in UTF-8 mode
-                print(f"DEBUG: Filling indicator at line {line_idx}, start {idx}, len {len(search_bytes)}")
-                self.fillIndicatorRange(line_idx, idx, line_idx, idx + len(search_bytes), 8)
+                # fillIndicatorRange uses character offsets in QsciScintilla
+                print(f"DEBUG: Filling indicator at line {line_idx}, start {idx}, len {len(text)}")
+                self.fillIndicatorRange(line_idx, idx, line_idx, idx + len(text), 8)
                 
-                start_idx = idx + len(search_bytes)
+                start_idx = idx + len(text)
 
     def _init_indicators(self):
         # Indicator 8 for highlighting occurrences
@@ -1788,6 +1862,47 @@ class XmlEditorWidget(QsciScintilla):
 
     def unfold_all(self):
         self.foldAll(False)
+
+    def fold_to_level(self, level_one_based: int):
+        """
+        Fold the document to the specified level.
+        Nodes at levels < level_one_based will be expanded.
+        Nodes at levels >= level_one_based will be folded.
+        """
+        # SC_FOLDLEVELBASE is 1024
+        SC_FOLDLEVELBASE = 1024
+        SC_FOLDLEVELNUMBERMASK = 0x0FFF
+        SC_FOLDLEVELHEADERFLAG = 0x2000
+        
+        # Calculate target indentation (0-based)
+        # Level 1 -> Indent 0
+        target_indent = level_one_based - 1
+        
+        # Disable updates for performance (optional, commented out if attributes missing)
+        # self.SendScintilla(QsciScintilla.SCI_SETLAYOUTCACHE, QsciScintilla.SC_CACHE_PAGE)
+        # self.SendScintilla(QsciScintilla.SCI_SETCOMMITEVENT, 0)
+        
+        try:
+            lines = self.lines()
+            for i in range(lines):
+                level_raw = self.SendScintilla(QsciScintilla.SCI_GETFOLDLEVEL, i)
+                level = level_raw & SC_FOLDLEVELNUMBERMASK
+                indent = level - SC_FOLDLEVELBASE
+                is_header = bool(level_raw & SC_FOLDLEVELHEADERFLAG)
+                
+                if is_header:
+                    is_expanded = self.SendScintilla(QsciScintilla.SCI_GETFOLDEXPANDED, i)
+                    
+                    if indent < target_indent:
+                        # Should be expanded
+                        if not is_expanded:
+                            self.foldLine(i)
+                    else:
+                        # Should be folded
+                        if is_expanded:
+                            self.foldLine(i)
+        except Exception as e:
+            print(f"Error in fold_to_level: {e}")
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -2304,7 +2419,7 @@ class ReplaceDialog(QDialog):
 
 class GoToLineDialog(QDialog):
     """Go to line dialog"""
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, current_line=1):
         super().__init__(parent)
         self.setWindowTitle("Go to Line")
         self.setModal(True)
@@ -2318,6 +2433,7 @@ class GoToLineDialog(QDialog):
         self.line_spinbox = QSpinBox()
         self.line_spinbox.setMinimum(1)
         self.line_spinbox.setMaximum(999999)
+        self.line_spinbox.setValue(current_line)
         line_layout.addWidget(self.line_spinbox)
         layout.addLayout(line_layout)
         
@@ -2331,6 +2447,13 @@ class GoToLineDialog(QDialog):
         layout.addWidget(button_box)
         
         self.setLayout(layout)
+        
+    def showEvent(self, event):
+        """Handle show event to select text"""
+        super().showEvent(event)
+        # Select all text in spinbox for quick editing
+        # Use QTimer to ensure it happens after dialog is fully shown and focused
+        QTimer.singleShot(0, self.line_spinbox.selectAll)
     
     def get_line_number(self):
         """Get line number"""
@@ -2547,6 +2670,10 @@ class MainWindow(QMainWindow):
         
         # Theme is applied via persisted settings in _load_persisted_flags
         
+        # FTP Manager
+        self.ftp_manager = FtpManager()
+        self.ftp_downloads = {} # local_path -> ftp_info
+        
         # Load recent files and open file if provided, otherwise open most recent
         self._load_recent_files()
         self._load_file_states()  # Load cursor/selection states
@@ -2571,6 +2698,30 @@ class MainWindow(QMainWindow):
 
         # Zip support state
         # Zip support state initialized earlier
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_toolbar_position()
+
+    def _update_toolbar_position(self):
+        if hasattr(self, 'toolbar') and self.toolbar:
+            # Position toolbar at top right, overlapping the menu bar
+            tb_size = self.toolbar.sizeHint()
+            tb_width = tb_size.width()
+            tb_height = tb_size.height()
+            
+            # Align to top right
+            x = self.width() - tb_width - 5
+            y = 0 
+            
+            self.toolbar.setGeometry(x, y, tb_width, tb_height)
+            self.toolbar.raise_()
+
+    def eventFilter(self, obj, event):
+        if hasattr(self, 'toolbar') and obj == self.toolbar:
+            if event.type() == QEvent.Type.LayoutRequest or event.type() == QEvent.Type.Resize:
+                self._update_toolbar_position()
+        return super().eventFilter(obj, event)
 
     def _get_version_string(self) -> str:
         """Calculate version string based on max modification time of core files."""
@@ -2707,6 +2858,10 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(lambda: self.open_file())
         file_menu.addAction(open_action)
         
+        open_ftp_action = QAction("Open from FTP...", self)
+        open_ftp_action.triggered.connect(self.open_from_ftp)
+        file_menu.addAction(open_ftp_action)
+        
         # Recent Files submenu
         self.recent_files_menu = file_menu.addMenu("Recent Files")
         self._update_recent_files_menu()
@@ -2722,6 +2877,10 @@ class MainWindow(QMainWindow):
         save_as_action.setShortcut("Ctrl+Shift+S")
         save_as_action.triggered.connect(self.save_file_as)
         file_menu.addAction(save_as_action)
+        
+        save_ftp_action = QAction("Save to FTP...", self)
+        save_ftp_action.triggered.connect(self.save_to_ftp)
+        file_menu.addAction(save_ftp_action)
         
         reread_action = QAction("Reread from Disk", self)
         reread_action.setShortcut("Ctrl+R")
@@ -2866,6 +3025,13 @@ class MainWindow(QMainWindow):
         move_selection_action.setToolTip("Move selected text to a new tab and replace with a link")
         move_selection_action.triggered.connect(self.move_selection_to_new_tab_with_link)
         edit_menu.addAction(move_selection_action)
+
+        # Action: Replace link with edited text (Inverse of F6)
+        replace_link_action = QAction("Replace Link with Tab Content", self)
+        replace_link_action.setShortcut("Shift+F6")
+        replace_link_action.setToolTip("Replace the link under cursor with content from the linked tab")
+        replace_link_action.triggered.connect(self.replace_link_with_tab_content)
+        edit_menu.addAction(replace_link_action)
         
         # XML menu
         xml_menu = menubar.addMenu("XML")
@@ -3079,9 +3245,31 @@ class MainWindow(QMainWindow):
         self.spartan_mode_action.toggled.connect(_on_spartan_mode_toggled)
         view_menu.addAction(self.spartan_mode_action)
         view_menu.addSeparator()
+        
+        # Folding submenu
+        folding_menu = view_menu.addMenu("Folding")
+        
+        # Unfold All (Alt+0)
+        unfold_all_action = QAction("Unfold All", self)
+        unfold_all_action.setShortcut("Alt+0")
+        unfold_all_action.triggered.connect(lambda: self.xml_editor.unfold_all() if self.xml_editor else None)
+        folding_menu.addAction(unfold_all_action)
+        
+        folding_menu.addSeparator()
+        
+        # Fold Levels 1-9 (Alt+1 to Alt+9)
+        for i in range(1, 10):
+            action = QAction(f"Fold to Level {i}", self)
+            action.setShortcut(f"Alt+{i}")
+            # Capture i in lambda default arg
+            action.triggered.connect(lambda checked, level=i: self.xml_editor.fold_to_level(level) if self.xml_editor else None)
+            folding_menu.addAction(action)
+            
+        view_menu.addSeparator()
 
         toggle_theme_action = QAction("Toggle Dark Theme", self)
         toggle_theme_action.triggered.connect(self.toggle_theme)
+        toggle_theme_action.setShortcut("F7")
         view_menu.addAction(toggle_theme_action)
         
         view_menu.addSeparator()
@@ -3379,7 +3567,12 @@ class MainWindow(QMainWindow):
     
     def _create_tool_bar(self):
         """Create tool bar"""
-        toolbar = self.addToolBar("Main")
+        # Create floating toolbar (parented to self but not added to layout)
+        toolbar = QToolBar("Main", self)
+        self.toolbar = toolbar
+        # Transparent background to blend with menu bar
+        toolbar.setStyleSheet("QToolBar { background: transparent; border: none; spacing: 2px; }")
+        toolbar.installEventFilter(self)
         
         new_btn = QAction("New", self)
         new_btn.triggered.connect(self.new_file)
@@ -3794,6 +3987,7 @@ class MainWindow(QMainWindow):
 
     def handle_definition_lookup(self, content):
         """Handle definition lookup request from editor (Ctrl+Click on quoted text)"""
+        print(f"DEBUG: handle_definition_lookup called with '{content}'")
         try:
             target_type = None
             target_name = None
@@ -3805,6 +3999,7 @@ class MainWindow(QMainWindow):
                 target_type = "Алгоритм"
                 target_name = content.split(".", 1)[1]
             
+            print(f"DEBUG: target_type={target_type}, target_name={target_name}")
             if not target_type or not target_name:
                 return
 
@@ -3814,68 +4009,103 @@ class MainWindow(QMainWindow):
             # We look for <Type ... Имя="Name" ...>
             # Use regex for robustness against attribute order and whitespace
             pattern = f'<{target_type}[^>]*Имя="{re.escape(target_name)}"[^>]*>'
+            print(f"DEBUG: searching for pattern '{pattern}'")
             match = re.search(pattern, editor_content)
             
             if not match:
+                print("DEBUG: match not found")
                 self.status_bar.showMessage(f"Definition not found: {content}", 3000)
                 return
             
             start_pos = match.end()
+            print(f"DEBUG: match found, start_pos={start_pos}")
             
             # Find the closing tag
-            # We need to handle nested tags of same type if any (unlikely for top-level definitions but possible)
-            # A simple search for </Type> after start_pos might be enough if we assume well-formedness
-            # But better to use a balanced finder if possible.
-            # For now, let's try simple search for closing tag.
             closing_tag = f"</{target_type}>"
             end_pos = editor_content.find(closing_tag, start_pos)
+            print(f"DEBUG: end_pos={end_pos}")
             
             if end_pos == -1:
                 self.status_bar.showMessage(f"Closing tag for {content} not found", 3000)
                 return
             
-            # Extract content (excluding the tag itself)
-            fragment_text = editor_content[start_pos:end_pos]
+            # Look for <Текст> child tag within the element
+            outer_content = editor_content[start_pos:end_pos]
             
-            # Remove leading newline if present (optional, but cleaner)
-            if fragment_text.startswith('\n'):
-                fragment_text = fragment_text[1:]
+            # Match <Текст>...</Текст>
+            # Use DOTALL to match across lines
+            text_match = re.search(r'<Текст>(.*?)</Текст>', outer_content, re.DOTALL)
+            
+            initial_text = outer_content
+            is_inner_text = False
+            is_cdata = False
+            
+            if text_match:
+                # Found <Текст>, use its content
+                is_inner_text = True
+                
+                initial_text = text_match.group(1)
+                print(f"DEBUG: Found <Текст> content, length={len(initial_text)}")
+                
+                # Check for CDATA wrapper
+                cdata_match = re.match(r'^\s*<!\[CDATA\[(.*)\]\]>\s*$', initial_text, re.DOTALL)
+                if cdata_match:
+                    is_cdata = True
+                    initial_text = cdata_match.group(1)
+                    print("DEBUG: Content is wrapped in CDATA")
+            else:
+                 print("DEBUG: <Текст> tag not found, showing full element content")
+                 # Fallback: remove leading newline if present
+                 if initial_text.startswith('\n'):
+                     initial_text = initial_text[1:]
             
             # Open in fragment editor
-            # We pass 'XML' as language (or maybe 1C Internal if supported)
-            dlg = FragmentEditorDialog(fragment_text, self.language_registry, initial_language='XML', parent=self)
-            
-            # If user saves, we need to update the original document
-            # This is tricky because we need to replace the exact range.
-            # We can use a callback.
+            print("DEBUG: opening FragmentEditorDialog")
+            dlg = FragmentEditorDialog(initial_text, self.language_registry, initial_language='XML', parent=self)
             
             def on_save(new_text):
-                # Replace the range in the editor
-                # We need to convert byte offsets (start_pos, end_pos) to line/index if using QScintilla API
-                # Or just use setText but that replaces everything.
-                # Better: use byte offsets if we are sure content hasn't changed.
-                # If content changed, we are in trouble.
-                # But dialog is modal? No, it's non-modal usually?
-                # FragmentEditorDialog inherits QDialog, so exec() makes it modal.
-                
-                # Check if content changed in background
+                # Reload content to handle external changes
                 current_content = self.xml_editor.get_content()
                 current_match = re.search(pattern, current_content)
                 if not current_match:
                     QMessageBox.warning(self, "Error", "Original definition not found (file changed?)")
                     return
                 
-                current_start = current_match.end()
-                current_end = current_content.find(closing_tag, current_start)
+                curr_start_pos = current_match.end()
+                curr_end_pos = current_content.find(closing_tag, curr_start_pos)
                 
-                if current_end == -1:
+                if curr_end_pos == -1:
                     QMessageBox.warning(self, "Error", "Closing tag not found (file changed?)")
                     return
                 
-                # Construct new content
-                new_full_content = current_content[:current_start] + ("\n" if not new_text.startswith('\n') else "") + new_text + current_content[current_end:]
+                curr_outer_content = current_content[curr_start_pos:curr_end_pos]
                 
-                # Set text and preserve cursor if possible
+                replacement = new_text
+                
+                if is_inner_text:
+                    # We need to find <Текст> again in the current content
+                    curr_text_match = re.search(r'<Текст>(.*?)</Текст>', curr_outer_content, re.DOTALL)
+                    if not curr_text_match:
+                         QMessageBox.warning(self, "Error", "<Текст> tag disappeared from element!")
+                         return
+                    
+                    # Wrap back in CDATA if needed
+                    if is_cdata:
+                        replacement = f"<![CDATA[{new_text}]]>"
+                    
+                    # Construct new outer content by replacing inner text
+                    new_outer_content = (curr_outer_content[:curr_text_match.start(1)] + 
+                                         replacement + 
+                                         curr_outer_content[curr_text_match.end(1):])
+                    
+                    new_full_content = current_content[:curr_start_pos] + new_outer_content + current_content[curr_end_pos:]
+                else:
+                    # Replace whole content
+                    new_full_content = (current_content[:curr_start_pos] + 
+                                        ("\n" if not new_text.startswith('\n') else "") + new_text + 
+                                        current_content[curr_end_pos:])
+                
+                # Apply changes
                 line, index = self.xml_editor.getCursorPosition()
                 self.xml_editor.set_content(new_full_content)
                 self.xml_editor.setCursorPosition(line, index)
@@ -3909,6 +4139,8 @@ class MainWindow(QMainWindow):
             
             # Connect save signal to update the main editor
             dialog.save_requested.connect(lambda new_text: self._update_fragment_in_editor(update_target, new_text))
+            # Connect convert signal
+            dialog.convert_requested.connect(lambda new_text: self._convert_fragment_to_link(update_target, new_text))
             
             dialog.setWindowFlags(Qt.WindowType.Window)  # Make it a non-modal window
             dialog.show()  # Show non-modal dialog
@@ -3933,6 +4165,44 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error updating fragment: {e}")
             QMessageBox.warning(self, "Update Error", f"Failed to update fragment: {e}")
+
+    def _convert_fragment_to_link(self, target, new_text: str):
+        """Update fragment and convert to linked tab."""
+        try:
+            # 1. Update content first
+            target.replaceSelectedText(new_text)
+            
+            # 2. Select the updated content
+            # replaceSelectedText leaves cursor at end, no selection.
+            # We need to calculate start position.
+            # Assuming cursor is at end of inserted text.
+            end_pos = target.get_cursor_char_position()
+            # Calculate length in bytes/chars depending on encoding? 
+            # QScintilla uses bytes for positions usually, but text is utf8.
+            # len(new_text) might differ from byte length if special chars.
+            # But let's assume utf8 handling is consistent.
+            # Actually, replaceSelectedText replaces the selection.
+            # We can use undo/redo or just calculate.
+            # Let's try to select back.
+            # NOTE: This relies on target being focused or active? No, just the widget.
+            
+            # Use byte length for safety with QScintilla
+            byte_len = len(new_text.encode('utf-8'))
+            start_pos = end_pos - byte_len
+            
+            # Verify range?
+            # target.setSelection(start_line, start_index, end_line, end_index)
+            # We need line/index.
+            
+            # Helper to set selection by char offset
+            self._set_selection_range(start_pos, end_pos)
+            
+            # 3. Call move_selection_to_new_tab_with_link
+            self.move_selection_to_new_tab_with_link()
+            
+        except Exception as e:
+            print(f"Error converting fragment: {e}")
+            QMessageBox.warning(self, "Convert Error", f"Failed to convert fragment: {e}")
 
     def _apply_selected_language_to_editor(self, editor: 'XmlEditorWidget'):
         """Apply the currently selected language profile to the given editor."""
@@ -4877,14 +5147,10 @@ class MainWindow(QMainWindow):
         """Setup auto-hide functionality for toolbar and tree header"""
         try:
             # Get toolbar reference
-            self.toolbar = self.findChild(QToolBar, "Main")
-            if not self.toolbar:
-                # Fallback: get first toolbar
-                toolbars = self.findChildren(QToolBar)
-                if toolbars:
-                    self.toolbar = toolbars[0]
+            # self.toolbar = self.findChild(QToolBar, "Main") # Already set in _create_tool_bar
             
-            # Create auto-hide manager for toolbar
+            # Toolbar auto-hide disabled because it is now floating in top-right
+            """
             if self.toolbar:
                 self.toolbar_auto_hide = AutoHideManager(
                     self.toolbar,
@@ -4899,6 +5165,7 @@ class MainWindow(QMainWindow):
                     self.toolbar_hover_zone = self.toolbar_auto_hide.create_hover_zone(self.centralWidget())
                     main_layout.insertWidget(0, self.toolbar_hover_zone)
                     self.toolbar_hover_zone.hide()  # Hidden initially
+            """
             
             # Find the tree label and level header container
             tree_label = None
@@ -5139,7 +5406,7 @@ class MainWindow(QMainWindow):
             
             # Action: Replace link with edited text
             replace_action = menu.addAction("Replace link with edited text from separate tab")
-            replace_action.setShortcut("Shift+F5")
+            replace_action.setShortcut("Shift+F6")
             replace_action.triggered.connect(self.replace_link_with_tab_content)
             
             menu.addSeparator()
@@ -5922,6 +6189,93 @@ class MainWindow(QMainWindow):
         self.recent_files = []
         self._save_recent_files()
     
+    def open_from_ftp(self):
+        """Open file from FTP server"""
+        try:
+            dialog = FtpBrowserDialog(self.ftp_manager, mode="open", parent=self)
+            dialog.file_selected.connect(self._on_ftp_file_selected)
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open FTP browser: {e}")
+
+    def _on_ftp_file_selected(self, local_path, ftp_info):
+        """Callback when file is selected from FTP"""
+        self.open_file(local_path)
+        
+        # Register FTP info
+        # Check if it was a zip
+        if local_path.lower().endswith('.zip'):
+             # If it was a zip, open_file -> _open_zip_workflow -> extracted XML
+             # We need to map the ZIP path to FTP info
+             self.ftp_downloads[local_path] = ftp_info
+        else:
+             # Normal file
+             self.ftp_downloads[local_path] = ftp_info
+             # Set on editor immediately if not zip
+             if hasattr(self, 'xml_editor') and self.xml_editor:
+                 self.xml_editor.ftp_source = ftp_info
+
+        self.status_label.setText(f"Opened from FTP: {ftp_info['host']}:{ftp_info['remote_path']}")
+
+    def save_to_ftp(self):
+        """Save current file to FTP"""
+        if not self.xml_editor.get_content():
+            QMessageBox.information(self, "Empty", "Nothing to save.")
+            return
+
+        try:
+            dialog = FtpBrowserDialog(self.ftp_manager, mode="save", parent=self)
+            dialog.file_selected.connect(self._on_ftp_save_selected)
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open FTP browser: {e}")
+
+    def _on_ftp_save_selected(self, remote_path, profile):
+        """Callback when saving to FTP"""
+        try:
+            # Save to temp file first
+            content = self.xml_editor.get_content()
+            
+            # Determine filename
+            filename = os.path.basename(remote_path)
+            temp_path = self.ftp_manager.get_temp_file_path(filename)
+            self.ftp_manager.ensure_temp_dir()
+            
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            # Upload
+            ftp = self.ftp_manager.connect(profile)
+            try:
+                self.ftp_manager.upload_file(ftp, temp_path, remote_path)
+            finally:
+                try:
+                    ftp.quit()
+                except:
+                    pass
+            
+            # Update state
+            ftp_info = {
+                "profile_id": profile.id,
+                "remote_path": remote_path,
+                "host": profile.host
+            }
+            
+            self.current_file = temp_path
+            if hasattr(self, 'xml_editor') and self.xml_editor:
+                self.xml_editor.ftp_source = ftp_info
+                self.xml_editor.file_path = temp_path
+                self.xml_editor.setModified(False)
+            
+            # Track it
+            self.ftp_downloads[temp_path] = ftp_info
+            
+            self._update_window_title()
+            self.status_label.setText(f"Saved to FTP: {profile.host}:{remote_path}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Upload Error", f"Failed to upload to FTP: {e}")
+
     def open_file(self, file_path=None):
         """Open XML file"""
         print(f"DEBUG: open_file called with {file_path}")
@@ -6015,7 +6369,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Reread File", "No file is currently open.")
             return
 
-        if self.xml_editor.document().isModified():
+        if self.xml_editor.isModified():
             reply = QMessageBox.question(
                 self, "Reread File",
                 "File has unsaved changes. Rereading will discard them.\nAre you sure?",
@@ -6225,10 +6579,28 @@ class MainWindow(QMainWindow):
         if not zip_source:
              zip_source = self.current_zip_source
 
+        # Virtual merge helper
+        content = self.xml_editor.get_content()
+        if hasattr(self, 'tab_link_map') and self.tab_link_map:
+            try:
+                pattern = re.compile(r"<!--\s*TABREF:\s*([A-Za-z0-9_\-]+)\s*-->")
+                def replace_link(match):
+                    link_id = match.group(1)
+                    if link_id in self.tab_link_map:
+                        editor = self.tab_link_map[link_id]
+                        # Check if editor is still in tabs (by iterating tabs)
+                        # self.tab_widget.indexOf(editor) might be slow if many tabs, but reliable
+                        if self.tab_widget.indexOf(editor) != -1:
+                            return editor.get_content()
+                    return match.group(0)
+                content = pattern.sub(replace_link, content)
+            except Exception as e:
+                print(f"Virtual merge error: {e}")
+
         if zip_source and self.current_file.startswith(zip_source['temp_dir']):
             # Save to temp first
             try:
-                content = self.xml_editor.get_content()
+                # content already merged
                 with open(self.current_file, 'w', encoding='utf-8') as file:
                     file.write(content)
                 
@@ -6267,16 +6639,57 @@ class MainWindow(QMainWindow):
             
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to update zip archive: {str(e)}")
+                return
+
+            # Check if Zip came from FTP and upload back
+            if zip_path in self.ftp_downloads:
+                ftp_info = self.ftp_downloads[zip_path]
+                try:
+                    profile = self.ftp_manager.get_profile(ftp_info['profile_id'])
+                    if profile:
+                        ftp = self.ftp_manager.connect(profile)
+                        try:
+                            self.ftp_manager.upload_file(ftp, zip_path, ftp_info['remote_path'])
+                            self.status_label.setText(f"Updated Zip and Uploaded to FTP: {os.path.basename(zip_path)}")
+                        finally:
+                            try:
+                                ftp.quit()
+                            except:
+                                pass
+                except Exception as e:
+                    QMessageBox.warning(self, "FTP Upload Error", f"Failed to upload Zip back to FTP: {e}")
+
             return
         
         try:
-            content = self.xml_editor.get_content()
+            # content already merged
             with open(self.current_file, 'w', encoding='utf-8') as file:
                 file.write(content)
             
-            self.xml_editor.document().setModified(False)
+            self.xml_editor.setModified(False)
             self.status_label.setText(f"Saved: {self.current_file}")
             
+            # Check if file came from FTP and upload back (Direct XML)
+            ftp_source = getattr(self.xml_editor, 'ftp_source', None)
+            if not ftp_source and self.current_file in self.ftp_downloads:
+                 ftp_source = self.ftp_downloads[self.current_file]
+            
+            if ftp_source:
+                try:
+                    profile = self.ftp_manager.get_profile(ftp_source['profile_id'])
+                    if profile:
+                        ftp = self.ftp_manager.connect(profile)
+                        try:
+                            self.ftp_manager.upload_file(ftp, self.current_file, ftp_source['remote_path'])
+                            self.status_label.setText(f"Saved and Uploaded to FTP: {ftp_source['remote_path']}")
+                        finally:
+                            try:
+                                ftp.quit()
+                            except:
+                                pass
+                except Exception as e:
+                    QMessageBox.warning(self, "FTP Upload Error", f"Failed to upload file back to FTP: {e}")
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save file: {str(e)}")
     
@@ -6490,7 +6903,14 @@ class MainWindow(QMainWindow):
     
     def show_goto_dialog(self):
         """Show go to line dialog"""
-        dialog = GoToLineDialog(self)
+        current_line = 1
+        try:
+            line, _ = self.xml_editor.getCursorPosition()
+            current_line = line + 1
+        except Exception:
+            pass
+            
+        dialog = GoToLineDialog(self, current_line)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             line_number = dialog.get_line_number()
             self.goto_line(line_number)
@@ -6586,7 +7006,8 @@ class MainWindow(QMainWindow):
                     "Ctrl+Shift+[ - Fold current element",
                     "Ctrl+Shift+] - Unfold current element",
                     "Ctrl+Shift+U - Unfold all",
-                    "Alt+2..9 - Fold all elements at level N"
+                    "Alt+0 - Unfold All",
+                    "Alt+1..9 - Fold all elements at level N"
                 ]),
                 ("Navigation & Selection", [
                     "Ctrl+T - Find in Tree (editor)",
@@ -7416,6 +7837,11 @@ Total size: {stats.total_size} bytes"""
         """Synchronize tree selection to current cursor position using index-aware paths.
         This re-enables cursor-to-tree syncing and respects sibling indices in paths (e.g., Tag[2])."""
         try:
+            # Check if line changed since last sync to avoid spamming logs
+            if hasattr(self, '_last_sync_line') and self._last_sync_line == line_number:
+                return
+            self._last_sync_line = line_number
+
             content = self.xml_editor.get_content()
             if not content:
                 self.status_label.setText("No content to sync")
@@ -9125,13 +9551,22 @@ Total size: {stats.total_size} bytes"""
     def toggle_theme(self):
         """Toggle between light and dark themes"""
         # Check current state from persisted flag
-        is_dark = self._read_flag('dark_theme', True)
+        is_dark = self._read_flag('dark_theme', False) # Default to False if not set
         
+        # Toggle
+        new_is_dark = not is_dark
+        
+        # Save new state
+        try:
+            self._save_flag('dark_theme', new_is_dark)
+        except Exception:
+            pass
+            
         # Use QTimer to defer theme application and prevent UI hang
-        if is_dark:
-            QTimer.singleShot(0, self.set_light_theme)
-        else:
+        if new_is_dark:
             QTimer.singleShot(0, self.set_dark_theme)
+        else:
+            QTimer.singleShot(0, self.set_light_theme)
     
     def set_dark_theme(self):
         """Apply dark theme"""
@@ -9284,12 +9719,33 @@ Total size: {stats.total_size} bytes"""
             background: none;
             width: 0px;
         }
+        QTextEdit, QPlainTextEdit {
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            border: 1px solid #464647;
+        }
+        QComboBox {
+            background-color: #3c3c3c;
+            color: #d4d4d4;
+            border: 1px solid #464647;
+            padding: 4px;
+        }
+        QComboBox::drop-down {
+            border: none;
+            background: #2d2d30;
+        }
         """
-        self.setStyleSheet(dark_style)
+        if QApplication.instance():
+            QApplication.instance().setStyleSheet(dark_style)
+        else:
+            self.setStyleSheet(dark_style)
         
-        # Update editor for dark theme
-        if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'set_dark_theme'):
-            self.xml_editor.set_dark_theme(True)
+        # Update all editors for dark theme
+        if hasattr(self, 'tab_widget'):
+            for i in range(self.tab_widget.count()):
+                widget = self.tab_widget.widget(i)
+                if hasattr(widget, 'set_dark_theme'):
+                    widget.set_dark_theme(True)
         
         # Update breadcrumb label styling
         if hasattr(self, 'breadcrumb_label'):
@@ -9460,12 +9916,33 @@ Total size: {stats.total_size} bytes"""
             background: none;
             width: 0px;
         }
+        QTextEdit, QPlainTextEdit {
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #ccc;
+        }
+        QComboBox {
+            background-color: #ffffff;
+            color: #000000;
+            border: 1px solid #ccc;
+            padding: 4px;
+        }
+        QComboBox::drop-down {
+            border: none;
+            background: #e0e0e0;
+        }
         """
-        self.setStyleSheet(light_style)
+        if QApplication.instance():
+            QApplication.instance().setStyleSheet(light_style)
+        else:
+            self.setStyleSheet(light_style)
         
-        # Update editor for light theme
-        if hasattr(self, 'xml_editor') and hasattr(self.xml_editor, 'set_dark_theme'):
-            self.xml_editor.set_dark_theme(False)
+        # Update all editors for light theme
+        if hasattr(self, 'tab_widget'):
+            for i in range(self.tab_widget.count()):
+                widget = self.tab_widget.widget(i)
+                if hasattr(widget, 'set_dark_theme'):
+                    widget.set_dark_theme(False)
         
         # Update breadcrumb label styling for light theme
         if hasattr(self, 'breadcrumb_label'):

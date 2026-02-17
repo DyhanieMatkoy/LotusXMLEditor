@@ -8,7 +8,6 @@ fix: после сборки --onedir пропала опция подсветк
 Добавь историю строк в диалог поиска
 
 add command
-
-Shift+F5      Replace link with edited text from separate tab
+Shift+F6      Replace link with edited text from separate tab
 
 to tab header context menu

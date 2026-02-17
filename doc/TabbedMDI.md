@@ -25,7 +25,7 @@ This document describes the tabbed multiple-document interface (MDI) added to th
   - The selected text is moved into a new tab titled `Subdoc N`.
   - A link comment replaces the selection in the original editor: `<!-- TABREF: tab-N -->`.
 
-- `Shift+F5` — Replace link with edited text from its tab.
+- `Shift+F6` — Replace link with edited text from its tab.
   - Place the cursor on or near a `TABREF` comment.
   - The link is replaced with the current content from the associated tab.
 
@@ -43,4 +43,4 @@ This document describes the tabbed multiple-document interface (MDI) added to th
 ## Tips
 
 - Use `F4` to quickly select nested elements and progressively widen selection to parent elements.
-- Use `F5` and `Shift+F5` to refactor parts of the XML into separate tabs and reinsert them when ready.
+- Use `F6` and `Shift+F6` to refactor parts of the XML into separate tabs and reinsert them when ready.

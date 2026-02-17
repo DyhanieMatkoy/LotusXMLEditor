@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QRadioButton, QButtonGroup, QPushButton, QWidget, 
                              QScrollArea, QLabel, QMenuBar, QStackedWidget, QComboBox)
 from PyQt6.QtGui import QFont, QAction, QColor
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QSettings
 from PyQt6.Qsci import QsciScintilla, QsciLexerXML
 
 from human_readable import get_human_readable_1c_xml
@@ -12,6 +12,7 @@ class FragmentEditorDialog(QDialog):
     """Dialog for editing/viewing XML fragments with selectable syntax highlighting."""
     
     save_requested = pyqtSignal(str)
+    convert_requested = pyqtSignal(str)
 
     def __init__(self, text, language_registry, initial_language='XML', parent=None):
         super().__init__(parent)
@@ -29,13 +30,26 @@ class FragmentEditorDialog(QDialog):
         # Configure margins (line numbers)
         self.editor.setMarginType(0, QsciScintilla.MarginType.NumberMargin)
         self.editor.setMarginWidth(0, "0000")
-        self.editor.setMarginsForegroundColor(QColor("#808080"))
-        self.editor.setMarginsBackgroundColor(QColor("#2b2b2b"))
         
-        # Colors
-        self.editor.setColor(QColor("#d4d4d4"))
-        self.editor.setPaper(QColor("#1e1e1e"))
-        self.editor.setCaretForegroundColor(QColor("white"))
+        # Determine theme
+        try:
+            settings = QSettings("visxml.net", "LotusXmlEditor")
+            self.is_dark_theme = settings.value("flags/dark_theme", False, type=bool)
+        except Exception:
+            self.is_dark_theme = False
+
+        if self.is_dark_theme:
+            self.editor.setMarginsForegroundColor(QColor("#808080"))
+            self.editor.setMarginsBackgroundColor(QColor("#2b2b2b"))
+            self.editor.setColor(QColor("#d4d4d4"))
+            self.editor.setPaper(QColor("#1e1e1e"))
+            self.editor.setCaretForegroundColor(QColor("white"))
+        else:
+            self.editor.setMarginsForegroundColor(QColor("#333333"))
+            self.editor.setMarginsBackgroundColor(QColor("#f0f0f0"))
+            self.editor.setColor(QColor("#000000"))
+            self.editor.setPaper(QColor("#ffffff"))
+            self.editor.setCaretForegroundColor(QColor("black"))
         
         # Context Menu
         self.editor.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -125,6 +139,11 @@ class FragmentEditorDialog(QDialog):
         self.btn_save.setDefault(True)
         btn_layout.addWidget(self.btn_save)
 
+        self.btn_convert = QPushButton("Save & Move to Tab")
+        self.btn_convert.setToolTip("Save changes and move the fragment to a new linked tab")
+        self.btn_convert.clicked.connect(self._on_convert)
+        btn_layout.addWidget(self.btn_convert)
+
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.reject)
         btn_layout.addWidget(btn_close)
@@ -137,6 +156,11 @@ class FragmentEditorDialog(QDialog):
     def _on_save(self):
         """Handle save button click"""
         self.save_requested.emit(self.editor.text())
+        self.accept()
+
+    def _on_convert(self):
+        """Handle convert button click"""
+        self.convert_requested.emit(self.editor.text())
         self.accept()
 
     def _setup_menu(self):
@@ -186,6 +210,18 @@ class FragmentEditorDialog(QDialog):
         remove_empty_lines_action.triggered.connect(self.remove_empty_lines)
         edit_menu.addAction(remove_empty_lines_action)
         
+        edit_menu.addSeparator()
+
+        escape_action = QAction("Escape XML Entities in Selection", self)
+        escape_action.setShortcut("Ctrl+Shift+K")
+        escape_action.triggered.connect(self.escape_xml_entities)
+        edit_menu.addAction(escape_action)
+
+        unescape_action = QAction("Unescape XML Entities in Selection", self)
+        unescape_action.setShortcut("Ctrl+Alt+U")
+        unescape_action.triggered.connect(self.unescape_xml_entities)
+        edit_menu.addAction(unescape_action)
+        
         return menubar
 
     def remove_empty_lines(self):
@@ -231,6 +267,16 @@ class FragmentEditorDialog(QDialog):
         
         remove_lines_action = menu.addAction("Remove Empty Lines")
         remove_lines_action.triggered.connect(self.remove_empty_lines)
+        
+        menu.addSeparator()
+
+        escape_action = menu.addAction("Escape XML Entities")
+        escape_action.setShortcut("Ctrl+Shift+K")
+        escape_action.triggered.connect(self.escape_xml_entities)
+
+        unescape_action = menu.addAction("Unescape XML Entities")
+        unescape_action.setShortcut("Ctrl+Alt+U")
+        unescape_action.triggered.connect(self.unescape_xml_entities)
         
         menu.exec(self.editor.mapToGlobal(position))
 
@@ -306,49 +352,69 @@ class FragmentEditorDialog(QDialog):
         finally:
             self.editor.endUndoAction()
 
-    def _toggle_block_comment(self, start_marker="<!--", end_marker="-->"):
-        """Toggle block comment around selection or current line."""
+    def _toggle_block_comment(self):
+        """Toggle block comment (<!-- ... -->) around selection."""
         self.editor.beginUndoAction()
         try:
             if not self.editor.hasSelectedText():
-                # Select current line
+                # No selection, select current line content
                 line, _ = self.editor.getCursorPosition()
-                len_line = self.editor.lineLength(line)
-                self.editor.setSelection(line, 0, line, len_line)
+                text = self.editor.text(line)
+                if not text.strip():
+                    return
+                self.editor.setSelection(line, 0, line, len(text))
             
-            text = self.editor.selectedText()
-            if not text: return
-
-            # Check if already commented (simple regex check)
-            # Note: This regex is simplified compared to original but should work for basic cases
-            pattern = fr"^\s*{re.escape(start_marker)}[\s\S]*{re.escape(end_marker)}\s*$"
-            if re.match(pattern, text):
-                # Unwrap
-                s_idx = text.find(start_marker)
-                e_idx = text.rfind(end_marker)
-                
-                if s_idx != -1 and e_idx != -1 and e_idx > s_idx:
-                    inner = text[s_idx+len(start_marker):e_idx]
-                    # Try to remove padding spaces
-                    if inner.startswith(' ') and inner.endswith(' ') and len(inner) >= 2:
-                         inner = inner[1:-1]
-                    
-                    pre = text[:s_idx]
-                    post = text[e_idx+len(end_marker):]
-                    new_text = pre + inner + post
-                    self.editor.replaceSelection(new_text)
+            selected_text = self.editor.selectedText()
+            
+            if selected_text.startswith("<!--") and selected_text.endswith("-->"):
+                # Uncomment
+                new_text = selected_text[4:-3]
             else:
-                # Wrap
-                # Handle trailing newline if present to avoid messing up block structure
-                # QScintilla selectedText() might not include trailing newline if selected strictly?
-                # But if we selected full line, it might.
-                
-                self.editor.replaceSelection(f"{start_marker} {text} {end_marker}")
-                
-        except Exception as e:
-            print(f"Toggle block comment error: {e}")
+                # Comment
+                new_text = f"<!--{selected_text}-->"
+            
+            self.editor.replaceSelection(new_text)
         finally:
             self.editor.endUndoAction()
+
+    def _apply_text_transform(self, transform_func):
+        """Apply a text transformation function to the selected text."""
+        if not self.editor.hasSelectedText():
+             return
+        
+        selected_text = self.editor.selectedText()
+        new_text = transform_func(selected_text)
+        
+        self.editor.replaceSelection(new_text)
+
+    def escape_xml_entities(self):
+        """Convert special characters in selection to XML entities."""
+        def escape_logic(text):
+            # 1. Safe & escape (preserve existing entities)
+            text = re.sub(r'&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)', '&amp;', text)
+            # 2. Others
+            text = text.replace('<', '&lt;')
+            text = text.replace('>', '&gt;')
+            text = text.replace('"', '&quot;')
+            text = text.replace("'", '&apos;')
+            text = text.replace('\u00A0', '&#160;')
+            return text
+            
+        self._apply_text_transform(escape_logic)
+
+    def unescape_xml_entities(self):
+        """Convert XML entities in selection back to characters."""
+        def unescape_logic(text):
+            text = text.replace('&lt;', '<')
+            text = text.replace('&gt;', '>')
+            text = text.replace('&quot;', '"')
+            text = text.replace('&apos;', "'")
+            text = text.replace('&#160;', '\u00A0')
+            text = text.replace('&#xA0;', '\u00A0')
+            text = text.replace('&amp;', '&')
+            return text
+            
+        self._apply_text_transform(unescape_logic)
 
     def _on_syntax_changed(self, button):
         lang = button.text()
@@ -363,21 +429,37 @@ class FragmentEditorDialog(QDialog):
                 lexer = QsciLexerXML(self.editor)
                 lexer.setDefaultFont(QFont("Consolas", 11))
                 
-                # Dark theme colors (matching main editor)
-                lexer.setColor(QColor("#d4d4d4"), QsciLexerXML.Default)
-                lexer.setColor(QColor("#569cd6"), QsciLexerXML.Tag)
-                lexer.setColor(QColor("#9cdcfe"), QsciLexerXML.Attribute) # VSCode style
-                lexer.setColor(QColor("#ce9178"), QsciLexerXML.HTMLDoubleQuotedString)
-                lexer.setColor(QColor("#ce9178"), QsciLexerXML.HTMLSingleQuotedString)
-                lexer.setColor(QColor("#6a9955"), QsciLexerXML.HTMLComment)
-                lexer.setColor(QColor("#dcdcaa"), QsciLexerXML.CDATA)
+                if self.is_dark_theme:
+                    # Dark theme colors (matching main editor)
+                    lexer.setColor(QColor("#d4d4d4"), QsciLexerXML.Default)
+                    lexer.setColor(QColor("#569cd6"), QsciLexerXML.Tag)
+                    lexer.setColor(QColor("#9cdcfe"), QsciLexerXML.Attribute) # VSCode style
+                    lexer.setColor(QColor("#ce9178"), QsciLexerXML.HTMLDoubleQuotedString)
+                    lexer.setColor(QColor("#ce9178"), QsciLexerXML.HTMLSingleQuotedString)
+                    lexer.setColor(QColor("#6a9955"), QsciLexerXML.HTMLComment)
+                    lexer.setColor(QColor("#dcdcaa"), QsciLexerXML.CDATA)
+                    lexer.setPaper(QColor("#1e1e1e"), QsciLexerXML.Default) # Ensure background matches
+                else:
+                    # Light theme colors
+                    lexer.setColor(QColor("#000000"), QsciLexerXML.Default)
+                    lexer.setColor(QColor("#0000FF"), QsciLexerXML.Tag)
+                    lexer.setColor(QColor("#A31515"), QsciLexerXML.Attribute)
+                    lexer.setColor(QColor("#008000"), QsciLexerXML.HTMLDoubleQuotedString)
+                    lexer.setColor(QColor("#008000"), QsciLexerXML.HTMLSingleQuotedString)
+                    lexer.setColor(QColor("#008000"), QsciLexerXML.HTMLComment)
+                    lexer.setColor(QColor("#8B4513"), QsciLexerXML.CDATA)
+                    lexer.setPaper(QColor("#ffffff"), QsciLexerXML.Default) # Ensure background matches
                 
                 self.editor.setLexer(lexer)
             else:
                 self.editor.setLexer(None)
                 self.editor.setFont(QFont("Consolas", 11))
-                self.editor.setColor(QColor("#d4d4d4"))
-                self.editor.setPaper(QColor("#1e1e1e"))
+                if self.is_dark_theme:
+                    self.editor.setColor(QColor("#d4d4d4"))
+                    self.editor.setPaper(QColor("#1e1e1e"))
+                else:
+                    self.editor.setColor(QColor("#000000"))
+                    self.editor.setPaper(QColor("#ffffff"))
                 
         except Exception as e:
             print(f"Fragment highlighting error: {e}")

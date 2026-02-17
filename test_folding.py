@@ -28,7 +28,21 @@ def test_folding():
     editor.set_content(test_xml)
     editor.set_line_numbers_visible(True)
     
-    print("Testing fold operations...")
+    # Print fold levels
+    print("\nFold Levels:")
+    SC_FOLDLEVELBASE = 1024
+    SC_FOLDLEVELNUMBERMASK = 0x0FFF
+    SC_FOLDLEVELHEADERFLAG = 0x2000
+    
+    for i in range(editor.lines()):
+        level_raw = editor.SendScintilla(editor.SCI_GETFOLDLEVEL, i)
+        level = level_raw & SC_FOLDLEVELNUMBERMASK
+        is_header = bool(level_raw & SC_FOLDLEVELHEADERFLAG)
+        indent = level - SC_FOLDLEVELBASE
+        content = editor.text(i).strip()
+        print(f"Line {i+1}: Level={level} (Indent={indent}), Header={is_header}, Content='{content}'")
+    
+    print("\nTesting fold operations...")
     
     # Test fold_lines
     print("Folding lines 3-5...")

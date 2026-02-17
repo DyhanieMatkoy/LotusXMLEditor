@@ -1,5 +1,15 @@
 # Release Notes
 
+## Version 2026-02-13
+
+### Features
+- **Code Folding Enhancements**:
+  - Added "Fold to Level" functionality (Alt+1 to Alt+9).
+  - Added "Unfold All" (Alt+0).
+  - Fixed visibility of folding markers in the editor margin (explicitly set margin mask and colors).
+  - Added "Folding" submenu in View menu.
+  - Improved compatibility with dark themes.
+
 ## Version 2026-02-04
 
 ### Features

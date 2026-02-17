@@ -19,6 +19,7 @@ dist/
 .coverage*
 .nox/
 .tox/
+.hypothesis/
 
 # Logs
 logs/

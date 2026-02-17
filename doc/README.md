@@ -197,6 +197,15 @@ See [AUTO_HIDE_USAGE.md](AUTO_HIDE_USAGE.md) for detailed usage guide.
 | Ctrl+Shift+1..9 | Set numbered bookmark (1-9) |
 | Ctrl+1..9 | Go to numbered bookmark (1-9) |
 
+#### Code Folding
+| Shortcut | Action |
+|----------|--------|
+| Ctrl+Shift+[ | Fold current element |
+| Ctrl+Shift+] | Unfold current element |
+| Ctrl+Shift+U | Unfold all (Legacy) |
+| Alt+0 | Unfold all |
+| Alt+1..9 | Fold all elements at level 1-9 |
+
 #### XML Operations
 | Shortcut | Action |
 |----------|--------|
