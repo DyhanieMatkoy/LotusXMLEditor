@@ -27,7 +27,7 @@ if %errorlevel% neq 0 (
 
 REM Clean previous builds
 echo Cleaning previous builds...
-if exist "dist\lxe.exe" del "dist\lxe.exe"
+if exist "dist\lxe" rmdir /s /q "dist\lxe"
 if exist "build" rmdir /s /q "build"
 
 echo.
@@ -46,21 +46,21 @@ if %errorlevel% equ 0 (
     echo.
     
     REM Show file info
-    if exist "dist\lxe.exe" (
-        for %%A in ("dist\lxe.exe") do (
+    if exist "dist\lxe\lxe.exe" (
+        for %%A in ("dist\lxe\lxe.exe") do (
             set FILESIZE=%%~zA
             set /a FILESIZE_MB=!FILESIZE! / 1024 / 1024
         )
         setlocal enabledelayedexpansion
-        echo Executable: dist\lxe.exe
+        echo Executable: dist\lxe\lxe.exe
         echo Size: !FILESIZE_MB! MB
         echo.
-        echo You can now run: dist\lxe.exe
+        echo You can now run: dist\lxe\lxe.exe
         echo.
         echo Opening dist folder...
-        explorer "dist"
+        explorer "dist\lxe"
     ) else (
-        echo WARNING: lxe.exe was not found in dist folder
+        echo WARNING: lxe.exe was not found in dist\lxe folder
     )
 ) else (
     echo.
