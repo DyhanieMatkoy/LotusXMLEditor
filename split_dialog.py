@@ -258,6 +258,11 @@ class XmlSplitConfigDialog(QDialog):
         self.xpath_edit = QsciScintilla()
         self.xpath_edit.setUtf8(True)
         self.xpath_edit.setFont(QFont("Consolas", 10))
+        # Disable margins for single-line-like edit
+        self.xpath_edit.setMargins(0)
+        self.xpath_edit.setMarginWidth(0, 0)
+        self.xpath_edit.setMarginWidth(1, 0)
+        self.xpath_edit.setMarginWidth(2, 0)
         self.xpath_edit.setMarginsBackgroundColor(QColor("#2b2b2b"))
         self.xpath_edit.setPaper(QColor("#2d2d30"))
         self.xpath_edit.setColor(QColor("#cccccc"))

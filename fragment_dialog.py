@@ -30,6 +30,9 @@ class FragmentEditorDialog(QDialog):
         # Configure margins (line numbers)
         self.editor.setMarginType(0, QsciScintilla.MarginType.NumberMargin)
         self.editor.setMarginWidth(0, "0000")
+        # Explicitly disable other margins to prevent artifacts
+        self.editor.setMarginWidth(1, 0)
+        self.editor.setMarginWidth(2, 0)
         
         # Determine theme
         try:
@@ -431,6 +434,10 @@ class FragmentEditorDialog(QDialog):
                 
                 if self.is_dark_theme:
                     # Dark theme colors (matching main editor)
+                    default_paper = QColor("#1e1e1e")
+                    lexer.setDefaultPaper(default_paper)
+                    lexer.setPaper(default_paper)  # Set global default for lexer
+
                     lexer.setColor(QColor("#d4d4d4"), QsciLexerXML.Default)
                     lexer.setColor(QColor("#569cd6"), QsciLexerXML.Tag)
                     lexer.setColor(QColor("#9cdcfe"), QsciLexerXML.Attribute) # VSCode style
@@ -438,9 +445,19 @@ class FragmentEditorDialog(QDialog):
                     lexer.setColor(QColor("#ce9178"), QsciLexerXML.HTMLSingleQuotedString)
                     lexer.setColor(QColor("#6a9955"), QsciLexerXML.HTMLComment)
                     lexer.setColor(QColor("#dcdcaa"), QsciLexerXML.CDATA)
-                    lexer.setPaper(QColor("#1e1e1e"), QsciLexerXML.Default) # Ensure background matches
+                    
+                    # Ensure background matches for all styles
+                    styles = [QsciLexerXML.Default, QsciLexerXML.Tag, QsciLexerXML.Attribute, 
+                              QsciLexerXML.HTMLDoubleQuotedString, QsciLexerXML.HTMLSingleQuotedString, 
+                              QsciLexerXML.HTMLComment, QsciLexerXML.CDATA, QsciLexerXML.Entity, QsciLexerXML.XMLStart]
+                    for style in styles:
+                        lexer.setPaper(default_paper, style)
                 else:
                     # Light theme colors
+                    default_paper = QColor("#ffffff")
+                    lexer.setDefaultPaper(default_paper)
+                    lexer.setPaper(default_paper)
+
                     lexer.setColor(QColor("#000000"), QsciLexerXML.Default)
                     lexer.setColor(QColor("#0000FF"), QsciLexerXML.Tag)
                     lexer.setColor(QColor("#A31515"), QsciLexerXML.Attribute)
@@ -448,7 +465,13 @@ class FragmentEditorDialog(QDialog):
                     lexer.setColor(QColor("#008000"), QsciLexerXML.HTMLSingleQuotedString)
                     lexer.setColor(QColor("#008000"), QsciLexerXML.HTMLComment)
                     lexer.setColor(QColor("#8B4513"), QsciLexerXML.CDATA)
-                    lexer.setPaper(QColor("#ffffff"), QsciLexerXML.Default) # Ensure background matches
+                    
+                    # Ensure background matches for all styles
+                    styles = [QsciLexerXML.Default, QsciLexerXML.Tag, QsciLexerXML.Attribute, 
+                              QsciLexerXML.HTMLDoubleQuotedString, QsciLexerXML.HTMLSingleQuotedString, 
+                              QsciLexerXML.HTMLComment, QsciLexerXML.CDATA, QsciLexerXML.Entity, QsciLexerXML.XMLStart]
+                    for style in styles:
+                        lexer.setPaper(default_paper, style)
                 
                 self.editor.setLexer(lexer)
             else:

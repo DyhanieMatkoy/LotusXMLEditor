@@ -1662,6 +1662,11 @@ class XmlEditorWidget(QsciScintilla):
             self.SendScintilla(2244, 1, -33554432)
             self.SendScintilla(2246, 1, 1)
             
+            # Disable other potential folding margins (Margin 2 is often default)
+            self.setMarginWidth(2, 0)
+            self.setMarginWidth(3, 0)
+            self.setMarginWidth(4, 0)
+            
             self.setFolding(QsciScintilla.FoldStyle.BoxedTreeFoldStyle)
         else:
             self.setMarginWidth(1, 0)
@@ -1776,11 +1781,8 @@ class XmlEditorWidget(QsciScintilla):
         if self.visibility_options['hide_values']:
             value_color = background_color
 
-        # Lexer colors
-        styles = [QsciLexerXML.Default, QsciLexerXML.Tag, QsciLexerXML.Attribute, 
-                  QsciLexerXML.HTMLDoubleQuotedString, QsciLexerXML.HTMLSingleQuotedString, 
-                  QsciLexerXML.HTMLComment, QsciLexerXML.CDATA, QsciLexerXML.Entity, QsciLexerXML.XMLStart]
-        for style in styles:
+        # Lexer colors - Ensure ALL styles have the correct background to prevent white fragments
+        for style in range(128):
             lexer.setPaper(background_color, style)
 
         lexer.setColor(default_color, QsciLexerXML.Default)
@@ -1792,6 +1794,13 @@ class XmlEditorWidget(QsciScintilla):
         lexer.setColor(cdata_color, QsciLexerXML.CDATA)
         lexer.setColor(entity_color, QsciLexerXML.Entity)
         
+        # Set whitespace colors just in case
+        self.setWhitespaceBackgroundColor(background_color)
+        if dark_theme:
+             self.setWhitespaceForegroundColor(QColor("#404040"))
+        else:
+             self.setWhitespaceForegroundColor(QColor("#bfbfbf"))
+
         if dark_theme:
             lexer.setColor(QColor("#569CD6"), QsciLexerXML.XMLStart) # Processing instruction
         else:
@@ -1906,14 +1915,14 @@ class XmlEditorWidget(QsciScintilla):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        menu.addAction("Undo", self.undo, QKeySequence("Ctrl+Z"))
-        menu.addAction("Redo", self.redo, QKeySequence("Ctrl+Y"))
+        menu.addAction("Undo", QKeySequence("Ctrl+Z"), self.undo)
+        menu.addAction("Redo", QKeySequence("Ctrl+Y"), self.redo)
         menu.addSeparator()
-        menu.addAction("Cut", self.cut, QKeySequence("Ctrl+X"))
-        menu.addAction("Copy", self.copy, QKeySequence("Ctrl+C"))
-        menu.addAction("Paste", self.paste, QKeySequence("Ctrl+V"))
+        menu.addAction("Cut", QKeySequence("Ctrl+X"), self.cut)
+        menu.addAction("Copy", QKeySequence("Ctrl+C"), self.copy)
+        menu.addAction("Paste", QKeySequence("Ctrl+V"), self.paste)
         menu.addSeparator()
-        menu.addAction("Select All", self.selectAll, QKeySequence("Ctrl+A"))
+        menu.addAction("Select All", QKeySequence("Ctrl+A"), self.selectAll)
         menu.addSeparator()
         
         main_window = self.window()
